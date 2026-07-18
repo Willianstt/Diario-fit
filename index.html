@@ -97,7 +97,18 @@ const fmtShort = (d) => d.slice(5);
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const uid = () => Math.random().toString(36).slice(2, 10);
 
-const DEFAULT_PROFILE = { name: "", age: "", goal: "manutencao", activityLevel: "moderado", heightCm: 175, refWeight: 80, kcal: 2400, proteinPerKg: 2.0, fatPerKg: 0.9 };
+const DEFAULT_PROFILE = { name: "", age: "", sex: "masculino", goal: "manutencao", activityLevel: "moderado", heightCm: 175, refWeight: 80, kcal: 2400, proteinPerKg: 2.0, fatPerKg: 0.9, waterGoalMl: 3000 };
+
+const ACTIVITY_MULTIPLIERS = { sedentario: 1.2, leve: 1.375, moderado: 1.55, intenso: 1.725, muito_intenso: 1.9 };
+const GOAL_ADJUSTMENTS = { perda: -500, manutencao: 0, ganho: 300 };
+
+function calcTdee({ sex, refWeight, heightCm, age, activityLevel }) {
+  const w = Number(refWeight), h = Number(heightCm), a = Number(age);
+  if (!w || !h || !a) return null;
+  const bmr = sex === "feminino" ? 10 * w + 6.25 * h - 5 * a - 161 : 10 * w + 6.25 * h - 5 * a + 5;
+  const mult = ACTIVITY_MULTIPLIERS[activityLevel] || 1.55;
+  return Math.round(bmr * mult);
+}
 
 function weekDates(dateStr) {
   const d = new Date(dateStr + "T00:00:00");
@@ -391,7 +402,112 @@ function getDayMeals(foodLog, date) {
   return raw;
 }
 
-function DiarioFit() {
+// ---------- seleção de perfil (uso familiar) ----------
+const ACTIVE_PROFILE_LS_KEY = "diario-active-profile-id";
+
+function AppRoot() {
+  const [loading, setLoading] = useState(true);
+  const [profiles, setProfiles] = useState([]);
+  const [activeProfileId, setActiveProfileId] = useState(null);
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      let list = await storeGet("profiles", null);
+
+      if (list === null) {
+        // primeira vez rodando neste banco: migra dados antigos (sem
+        // prefixo de perfil) para um perfil "Principal", se existirem.
+        const legacyGoals = await storeGet("profile-goals", null);
+        const firstProfile = { id: uid(), name: "Principal" };
+        list = [firstProfile];
+        await storeSet("profiles", list);
+
+        if (legacyGoals !== null) {
+          const legacyKeys = ["profile-goals", "food-log", "custom-foods", "training-plans", "training-log", "custom-exercises", "evolution-log"];
+          for (const k of legacyKeys) {
+            const val = await storeGet(k, null);
+            if (val !== null) await storeSet(`${firstProfile.id}:${k}`, val);
+          }
+        }
+      }
+
+      setProfiles(list);
+      const saved = localStorage.getItem(ACTIVE_PROFILE_LS_KEY);
+      if (saved && list.some((p) => p.id === saved)) {
+        setActiveProfileId(saved);
+      } else if (list.length === 1) {
+        setActiveProfileId(list[0].id);
+        localStorage.setItem(ACTIVE_PROFILE_LS_KEY, list[0].id);
+      }
+      setLoading(false);
+    })();
+  }, []);
+
+  const chooseProfile = (id) => {
+    localStorage.setItem(ACTIVE_PROFILE_LS_KEY, id);
+    setActiveProfileId(id);
+  };
+
+  const createProfile = async () => {
+    if (!newName.trim()) return;
+    const p = { id: uid(), name: newName.trim() };
+    const next = [...profiles, p];
+    setProfiles(next);
+    await storeSet("profiles", next);
+    setNewName("");
+    setCreating(false);
+    chooseProfile(p.id);
+  };
+
+  const switchProfile = () => {
+    localStorage.removeItem(ACTIVE_PROFILE_LS_KEY);
+    setActiveProfileId(null);
+  };
+
+  if (loading) {
+    return <div className="min-h-screen bg-black flex items-center justify-center"><span className="font-mono text-zinc-400 text-sm tracking-widest">carregando…</span></div>;
+  }
+
+  if (activeProfileId) {
+    return <DiarioFit profileId={activeProfileId} onSwitchProfile={switchProfile} profileName={profiles.find((p) => p.id === activeProfileId)?.name || ""} />;
+  }
+
+  return (
+    <div className="min-h-screen bg-black text-white flex flex-col items-center justify-center px-6" style={{ fontFamily: "'Inter', system-ui, sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+        .font-display { font-family: 'Barlow Condensed', sans-serif; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+      `}</style>
+      <p className="font-mono text-[10px] tracking-[0.25em] text-zinc-500 uppercase mb-1">Diário</p>
+      <h1 className="font-display text-3xl font-bold mb-8">Quem é você?</h1>
+
+      <div className="w-full max-w-xs flex flex-col gap-2">
+        {profiles.map((p) => (
+          <button key={p.id} onClick={() => chooseProfile(p.id)} className="bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-left text-[15px] font-medium hover:border-green-500 transition">
+            {p.name}
+          </button>
+        ))}
+
+        {!creating ? (
+          <button onClick={() => setCreating(true)} className="mt-2 flex items-center justify-center gap-1.5 border border-dashed border-zinc-700 rounded-xl px-4 py-3 text-[14px] text-zinc-400 hover:text-white hover:border-zinc-500 transition">
+            <Plus size={15} /> Novo perfil
+          </button>
+        ) : (
+          <div className="mt-2 flex flex-col gap-2">
+            <input autoFocus value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Nome" className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2.5 text-[14px] focus:outline-none focus:border-green-500" />
+            <button onClick={createProfile} disabled={!newName.trim()} className="bg-green-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-black font-semibold rounded-lg py-2.5 text-[14px]">Criar perfil</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DiarioFit({ profileId, onSwitchProfile, profileName }) {
+  const pk = (k) => `${profileId}:${k}`;
   const [tab, setTab] = useState("nutricao");
   const [date, setDate] = useState(todayStr());
   const [loading, setLoading] = useState(true);
@@ -403,6 +519,8 @@ function DiarioFit() {
   const [trainingLog, setTrainingLog] = useState({});
   const [customExercises, setCustomExercises] = useState([]);
   const [evolutionLog, setEvolutionLog] = useState({});
+  const [waterLog, setWaterLog] = useState({});
+  const [recipes, setRecipes] = useState([]);
 
   const [showProfile, setShowProfile] = useState(false);
   const [addFoodCtx, setAddFoodCtx] = useState(null); // { mealId, editing } | null
@@ -410,14 +528,16 @@ function DiarioFit() {
 
   useEffect(() => {
     (async () => {
-      const [p, f, cf, pl, tl, ce, el] = await Promise.all([
-        storeGet("profile-goals", DEFAULT_PROFILE),
-        storeGet("food-log", {}),
-        storeGet("custom-foods", []),
-        storeGet("training-plans", []),
-        storeGet("training-log", {}),
-        storeGet("custom-exercises", []),
-        storeGet("evolution-log", {}),
+      const [p, f, cf, pl, tl, ce, el, wl, rc] = await Promise.all([
+        storeGet(pk("profile-goals"), DEFAULT_PROFILE),
+        storeGet(pk("food-log"), {}),
+        storeGet(pk("custom-foods"), []),
+        storeGet(pk("training-plans"), []),
+        storeGet(pk("training-log"), {}),
+        storeGet(pk("custom-exercises"), []),
+        storeGet(pk("evolution-log"), {}),
+        storeGet(pk("water-log"), {}),
+        storeGet(pk("recipes"), []),
       ]);
       setProfile({ ...DEFAULT_PROFILE, ...p });
       setFoodLog(f);
@@ -426,6 +546,8 @@ function DiarioFit() {
       setTrainingLog(tl);
       setCustomExercises(ce);
       setEvolutionLog(el);
+      setWaterLog(wl);
+      setRecipes(rc);
       setLoading(false);
     })();
   }, []);
@@ -449,49 +571,73 @@ function DiarioFit() {
     }), { kcal: 0, protein: 0, carbs: 0, fat: 0 });
   }, [dayMeals]);
 
-  const saveProfile = async (p) => { setProfile(p); await storeSet("profile-goals", p); setShowProfile(false); };
+  const saveProfile = async (p) => { setProfile(p); await storeSet(pk("profile-goals"), p); setShowProfile(false); };
   const addFood = async (mealId, food) => {
     const next = { ...foodLog, [date]: { ...dayMeals, [mealId]: [...(dayMeals[mealId] || []), { ...food, id: uid() }] } };
-    setFoodLog(next); await storeSet("food-log", next);
+    setFoodLog(next); await storeSet(pk("food-log"), next);
   };
   const removeFood = async (mealId, id) => {
     const next = { ...foodLog, [date]: { ...dayMeals, [mealId]: (dayMeals[mealId] || []).filter((f) => f.id !== id) } };
-    setFoodLog(next); await storeSet("food-log", next);
+    setFoodLog(next); await storeSet(pk("food-log"), next);
   };
   const editFood = async (mealId, id, updated) => {
     const next = { ...foodLog, [date]: { ...dayMeals, [mealId]: (dayMeals[mealId] || []).map((f) => (f.id === id ? { ...f, ...updated } : f)) } };
-    setFoodLog(next); await storeSet("food-log", next);
+    setFoodLog(next); await storeSet(pk("food-log"), next);
   };
   const addCustomFood = async (food) => {
     const next = [...customFoods, { ...food, id: uid() }];
-    setCustomFoods(next); await storeSet("custom-foods", next);
+    setCustomFoods(next); await storeSet(pk("custom-foods"), next);
   };
   const removeCustomFood = async (id) => {
     const next = customFoods.filter((f) => f.id !== id);
-    setCustomFoods(next); await storeSet("custom-foods", next);
+    setCustomFoods(next); await storeSet(pk("custom-foods"), next);
   };
-  const savePlans = async (next) => { setPlans(next); await storeSet("training-plans", next); };
+  const savePlans = async (next) => { setPlans(next); await storeSet(pk("training-plans"), next); };
   const addCustomExercise = async (name) => {
     if (customExercises.some((e) => normalize(e.name) === normalize(name))) return;
     const next = [...customExercises, { id: uid(), name }];
-    setCustomExercises(next); await storeSet("custom-exercises", next);
+    setCustomExercises(next); await storeSet(pk("custom-exercises"), next);
   };
   const removeCustomExercise = async (id) => {
     const next = customExercises.filter((e) => e.id !== id);
-    setCustomExercises(next); await storeSet("custom-exercises", next);
+    setCustomExercises(next); await storeSet(pk("custom-exercises"), next);
   };
   const saveTrainingDay = async (dayData) => {
     const next = { ...trainingLog, [date]: dayData };
-    setTrainingLog(next); await storeSet("training-log", next);
+    setTrainingLog(next); await storeSet(pk("training-log"), next);
   };
   const saveEvolutionDay = async (entry) => {
     const next = { ...evolutionLog, [date]: { ...(evolutionLog[date] || {}), ...entry } };
-    setEvolutionLog(next); await storeSet("evolution-log", next);
+    setEvolutionLog(next); await storeSet(pk("evolution-log"), next);
   };
   const deleteEvolutionDay = async () => {
     const next = { ...evolutionLog };
     delete next[date];
-    setEvolutionLog(next); await storeSet("evolution-log", next);
+    setEvolutionLog(next); await storeSet(pk("evolution-log"), next);
+  };
+
+  const dayWaterMl = waterLog[date] || 0;
+  const addWater = async (ml) => {
+    const next = { ...waterLog, [date]: Math.max(0, (waterLog[date] || 0) + ml) };
+    setWaterLog(next); await storeSet(pk("water-log"), next);
+  };
+  const resetWater = async () => {
+    const next = { ...waterLog, [date]: 0 };
+    setWaterLog(next); await storeSet(pk("water-log"), next);
+  };
+
+  const saveRecipe = async (name, items) => {
+    const next = [...recipes, { id: uid(), name, items }];
+    setRecipes(next); await storeSet(pk("recipes"), next);
+  };
+  const removeRecipe = async (id) => {
+    const next = recipes.filter((r) => r.id !== id);
+    setRecipes(next); await storeSet(pk("recipes"), next);
+  };
+  const addRecipeToMeal = async (mealId, recipe) => {
+    const items = recipe.items.map((it) => ({ ...it, id: uid() }));
+    const next = { ...foodLog, [date]: { ...dayMeals, [mealId]: [...(dayMeals[mealId] || []), ...items] } };
+    setFoodLog(next); await storeSet(pk("food-log"), next);
   };
 
   const shiftDate = (delta) => {
@@ -557,6 +703,11 @@ function DiarioFit() {
             onRemove={removeFood}
             onAdd={(mealId) => setAddFoodCtx({ mealId, editing: null })}
             onEdit={(mealId, food) => setAddFoodCtx({ mealId, editing: food })}
+            waterMl={dayWaterMl}
+            waterGoalMl={profile.waterGoalMl}
+            onAddWater={addWater}
+            onResetWater={resetWater}
+            onSaveRecipe={saveRecipe}
           />
         )}
         {tab === "treino" && (
@@ -572,10 +723,10 @@ function DiarioFit() {
           />
         )}
         {tab === "evolucao" && <EvolucaoTab evolutionLog={evolutionLog} date={date} heightCm={profile.heightCm} onSave={saveEvolutionDay} onDelete={deleteEvolutionDay} />}
-        {tab === "checkin" && <CheckinTab date={date} foodLog={foodLog} trainingLog={trainingLog} evolutionLog={evolutionLog} kcalGoal={profile.kcal} />}
+        {tab === "checkin" && <CheckinTab date={date} foodLog={foodLog} trainingLog={trainingLog} evolutionLog={evolutionLog} kcalGoal={profile.kcal} profileName={profile.name || profileName} />}
       </main>
 
-      {showProfile && <ProfileModal profile={profile} onSave={saveProfile} onClose={() => setShowProfile(false)} />}
+      {showProfile && <ProfileModal profile={profile} onSave={saveProfile} onClose={() => setShowProfile(false)} onSwitchProfile={onSwitchProfile} profileName={profileName} />}
       {addFoodCtx && (
         <AddFoodModal
           editing={addFoodCtx.editing}
@@ -584,6 +735,9 @@ function DiarioFit() {
           customFoods={customFoods}
           onSaveCustomFood={addCustomFood}
           onRemoveCustomFood={removeCustomFood}
+          recipes={recipes}
+          onAddRecipe={(recipe) => addRecipeToMeal(addFoodCtx.mealId, recipe)}
+          onRemoveRecipe={removeRecipe}
           onClose={() => setAddFoodCtx(null)}
         />
       )}
@@ -593,7 +747,7 @@ function DiarioFit() {
 }
 
 // ---------- Nutrição ----------
-function NutricaoTab({ totals, goals, dayMeals, onRemove, onAdd, onEdit }) {
+function NutricaoTab({ totals, goals, dayMeals, onRemove, onAdd, onEdit, waterMl, waterGoalMl, onAddWater, onResetWater, onSaveRecipe }) {
   return (
     <div className="pt-6">
       <div className="flex flex-col items-center"><CalorieDial consumed={totals.kcal} goal={goals.kcal} /></div>
@@ -602,6 +756,8 @@ function NutricaoTab({ totals, goals, dayMeals, onRemove, onAdd, onEdit }) {
         <MacroBar label="Carbo" consumed={totals.carbs} goal={goals.carbs} color="#16A34A" />
         <MacroBar label="Gordura" consumed={totals.fat} goal={goals.fat} color="#FFFFFF" />
       </div>
+
+      <WaterWidget ml={waterMl} goalMl={waterGoalMl} onAdd={onAddWater} onReset={onResetWater} />
 
       <div className="mt-8 flex flex-col gap-6">
         {MEALS.map((meal) => {
@@ -628,6 +784,17 @@ function NutricaoTab({ totals, goals, dayMeals, onRemove, onAdd, onEdit }) {
                   </div>
                 ))}
               </div>
+              {items.length > 0 && (
+                <button
+                  onClick={() => {
+                    const name = window.prompt("Nome da receita (ex: Shake pós-treino):");
+                    if (name && name.trim()) onSaveRecipe(name.trim(), items.map(({ id, ...rest }) => rest));
+                  }}
+                  className="mt-2 font-mono text-[11px] text-zinc-500 hover:text-green-500 transition"
+                >
+                  💾 salvar "{meal.label.toLowerCase()}" de hoje como receita
+                </button>
+              )}
             </div>
           );
         })}
@@ -636,7 +803,27 @@ function NutricaoTab({ totals, goals, dayMeals, onRemove, onAdd, onEdit }) {
   );
 }
 
-function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFood, onRemoveCustomFood, onClose }) {
+function WaterWidget({ ml, goalMl, onAdd, onReset }) {
+  const pct = goalMl > 0 ? Math.min(100, Math.round((ml / goalMl) * 100)) : 0;
+  return (
+    <div className="mt-6 bg-zinc-900 border border-zinc-800 rounded-xl p-3.5">
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">Água</span>
+        <span className="font-mono text-[12px] text-zinc-400">{ml}<span className="text-zinc-600">/{goalMl}ml</span></span>
+      </div>
+      <div className="mt-2 h-[6px] rounded-full bg-zinc-800 overflow-hidden">
+        <div className="h-full bg-white rounded-full transition-all duration-500" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="mt-3 flex gap-2">
+        <button onClick={() => onAdd(200)} className="flex-1 bg-black border border-zinc-700 rounded-lg py-1.5 text-[12px] font-mono text-zinc-300 active:border-white transition">+200ml</button>
+        <button onClick={() => onAdd(500)} className="flex-1 bg-black border border-zinc-700 rounded-lg py-1.5 text-[12px] font-mono text-zinc-300 active:border-white transition">+500ml</button>
+        <button onClick={onReset} className="px-3 bg-black border border-zinc-700 rounded-lg text-zinc-500 active:text-white transition"><RotateCcw size={13} /></button>
+      </div>
+    </div>
+  );
+}
+
+function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFood, onRemoveCustomFood, recipes, onAddRecipe, onRemoveRecipe, onClose }) {
   const [mode, setMode] = useState(editing ? "manual" : "buscar");
 
   // busca
@@ -673,11 +860,33 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
       {!editing && (
         <div className="flex gap-1 bg-black rounded-lg p-1 border border-zinc-800 mb-3">
           <button onClick={() => setMode("buscar")} className={`flex-1 py-1.5 rounded-md text-[13px] font-medium transition ${mode === "buscar" ? "bg-zinc-800 text-white" : "text-zinc-500"}`}>Buscar</button>
+          <button onClick={() => setMode("receitas")} className={`flex-1 py-1.5 rounded-md text-[13px] font-medium transition ${mode === "receitas" ? "bg-zinc-800 text-white" : "text-zinc-500"}`}>Receitas</button>
           <button onClick={() => setMode("manual")} className={`flex-1 py-1.5 rounded-md text-[13px] font-medium transition ${mode === "manual" ? "bg-zinc-800 text-white" : "text-zinc-500"}`}>Manual</button>
         </div>
       )}
 
-      {mode === "buscar" ? (
+      {mode === "receitas" && (
+        <div className="flex flex-col gap-1 max-h-[50vh] overflow-y-auto">
+          {(!recipes || recipes.length === 0) && <p className="text-center text-[13px] text-zinc-500 font-mono py-6">nenhuma receita salva ainda — salve uma refeição em "Nutrição" pra ela aparecer aqui</p>}
+          {recipes && recipes.map((r) => {
+            const totalKcal = r.items.reduce((s, it) => s + Number(it.kcal || 0), 0);
+            return (
+              <div key={r.id} className="flex items-center gap-1">
+                <button
+                  onClick={() => { onAddRecipe(r); onClose(); }}
+                  className="flex-1 flex items-center justify-between text-left bg-black hover:bg-zinc-800 border border-zinc-800 rounded-lg px-3 py-2 transition"
+                >
+                  <span className="text-[13px]">{r.name}</span>
+                  <span className="font-mono text-[11px] text-zinc-500">{Math.round(totalKcal)} kcal · {r.items.length} itens</span>
+                </button>
+                <button onClick={() => onRemoveRecipe(r.id)} className="text-zinc-500 hover:text-white p-1"><Trash2 size={14} /></button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {mode !== "receitas" && (mode === "buscar" ? (
         <div className="flex flex-col gap-3">
           {!selected ? (
             <>
@@ -743,7 +952,7 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
             {editing ? "Salvar alterações" : "Lançar alimento"}
           </button>
         </div>
-      )}
+      ))}
     </Modal>
   );
 }
@@ -1311,12 +1520,13 @@ function MeasurementCarousel({ evolutionLog }) {
     </div>
   );
 }
-function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal }) {
+function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal, profileName }) {
   const dates = weekDates(date);
 
   const kcalByDate = {};
-  Object.entries(foodLog).forEach(([d, items]) => {
-    const sum = (items || []).reduce((s, f) => s + Number(f.kcal || 0), 0);
+  Object.entries(foodLog).forEach(([d, meals]) => {
+    const items = Array.isArray(meals) ? meals : Object.values(meals || {}).flat();
+    const sum = items.reduce((s, f) => s + Number(f.kcal || 0), 0);
     if (sum > 0) kcalByDate[d] = sum;
   });
   const nutritionSuccessSet = new Set(
@@ -1343,9 +1553,40 @@ function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal }) {
 
   const hasAnyData = Object.keys(kcalByDate).length > 0 || Object.keys(trainingLog).length > 0;
 
+  const exportReport = () => {
+    const w = window.open("", "_blank");
+    if (!w) return;
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Relatório semanal</title>
+      <style>
+        body{font-family:-apple-system,Arial,sans-serif;padding:32px;color:#111;max-width:640px;margin:0 auto;}
+        h1{font-size:22px;margin-bottom:0;} .sub{color:#666;font-size:13px;margin-top:2px;margin-bottom:24px;}
+        .card{border:1px solid #ddd;border-radius:10px;padding:16px;margin-bottom:14px;}
+        .label{font-size:11px;text-transform:uppercase;color:#888;letter-spacing:.05em;}
+        .val{font-size:22px;font-weight:600;margin-top:2px;}
+        .row{display:flex;justify-content:space-between;gap:16px;}
+      </style></head><body>
+      <h1>Relatório semanal — ${profileName || ""}</h1>
+      <p class="sub">Semana de ${fmtShort(dates[0])} a ${fmtShort(dates[6])}</p>
+      <div class="row">
+        <div class="card" style="flex:1"><div class="label">Nutrição — média diária</div><div class="val">${avgKcal} / ${kcalGoal} kcal</div><div class="label" style="margin-top:8px">Dias dentro da meta: ${nutritionSuccessDaysWeek}/7 · sequência máxima: ${nutritionMaxStreak}</div></div>
+      </div>
+      <div class="row">
+        <div class="card" style="flex:1"><div class="label">Treino</div><div class="val">${trainingSuccessDaysWeek}/7 dias</div><div class="label" style="margin-top:8px">Sequência máxima: ${trainingMaxStreak}</div></div>
+      </div>
+      ${weightDelta !== null ? `<div class="card"><div class="label">Variação de peso na semana</div><div class="val">${weightDelta > 0 ? "+" : ""}${weightDelta}kg</div></div>` : ""}
+      <p class="sub">Gerado em ${new Date().toLocaleDateString("pt-BR")}</p>
+      </body></html>`;
+    w.document.write(html);
+    w.document.close();
+    setTimeout(() => w.print(), 300);
+  };
+
   return (
     <div className="pt-6 flex flex-col gap-4">
-      <h2 className="font-display text-xl font-semibold tracking-tight">Semana de {fmtShort(dates[0])} a {fmtShort(dates[6])}</h2>
+      <div className="flex items-center justify-between">
+        <h2 className="font-display text-xl font-semibold tracking-tight">Semana de {fmtShort(dates[0])} a {fmtShort(dates[6])}</h2>
+        <button onClick={exportReport} className="font-mono text-[11px] text-zinc-400 border border-zinc-700 rounded-lg px-2.5 py-1.5 hover:text-white transition">exportar relatório</button>
+      </div>
 
       <TrendCard title="Nutrição" current={avgKcal} goal={kcalGoal} unit="cal" weekDots={nutritionDots} successDays={nutritionSuccessDaysWeek} maxStreak={nutritionMaxStreak} />
       <TrendCard title="Treino" current={trainingSuccessDaysWeek} goal={7} unit="dias" weekDots={trainingDots} successDays={trainingSuccessDaysWeek} maxStreak={trainingMaxStreak} />
@@ -1404,7 +1645,7 @@ function TrendCard({ title, current, goal, unit, weekDots, successDays, maxStrea
 }
 
 // ---------- Profile modal ----------
-function ProfileModal({ profile, onSave, onClose }) {
+function ProfileModal({ profile, onSave, onClose, onSwitchProfile, profileName }) {
   const [form, setForm] = useState(profile);
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const refWeight = Number(form.refWeight) || 0;
@@ -1412,12 +1653,30 @@ function ProfileModal({ profile, onSave, onClose }) {
   const proteinG = Math.round((Number(form.proteinPerKg) || 0) * refWeight);
   const fatG = Math.round((Number(form.fatPerKg) || 0) * refWeight);
   const carbsG = Math.max(0, Math.round((kcal - proteinG * 4 - fatG * 9) / 4));
+
+  const tdee = calcTdee(form);
+  const suggestedKcal = tdee ? tdee + (GOAL_ADJUSTMENTS[form.goal] || 0) : null;
+
   return (
     <Modal onClose={onClose} title="Perfil e metas">
       <div className="flex flex-col gap-3">
-        <div className="grid grid-cols-2 gap-3">
+        {profileName && (
+          <div className="flex items-center justify-between bg-black border border-zinc-800 rounded-lg px-3 py-2">
+            <span className="font-mono text-[12px] text-zinc-400">perfil: <span className="text-white">{profileName}</span></span>
+            {onSwitchProfile && <button onClick={onSwitchProfile} className="font-mono text-[11px] text-green-500">trocar perfil</button>}
+          </div>
+        )}
+
+        <div className="grid grid-cols-3 gap-3">
           <Field label="Nome" value={form.name} onChange={set("name")} placeholder="Seu nome" />
           <Field label="Idade" value={form.age} onChange={set("age")} type="number" />
+          <label className="flex flex-col gap-1">
+            <span className="text-[11px] font-mono uppercase tracking-wider text-zinc-500">Sexo</span>
+            <select value={form.sex} onChange={set("sex")} className="bg-black border border-zinc-700 rounded-lg px-3 py-2 text-[14px] focus:outline-none focus:border-green-500">
+              <option value="masculino">Masc.</option>
+              <option value="feminino">Fem.</option>
+            </select>
+          </label>
         </div>
         <div className="grid grid-cols-2 gap-3">
           <label className="flex flex-col gap-1">
@@ -1441,7 +1700,18 @@ function ProfileModal({ profile, onSave, onClose }) {
         </div>
         <Field label="Altura (cm)" value={form.heightCm} onChange={set("heightCm")} type="number" />
         <Field label="Peso de referência (kg)" value={form.refWeight} onChange={set("refWeight")} type="number" />
+
         <Field label="Meta de calorias diárias (kcal)" value={form.kcal} onChange={set("kcal")} type="number" />
+        {suggestedKcal !== null && (
+          <button
+            onClick={() => setForm({ ...form, kcal: String(suggestedKcal) })}
+            className="flex items-center justify-between bg-black border border-zinc-800 hover:border-green-500 rounded-lg px-3 py-2 text-left transition"
+          >
+            <span className="font-mono text-[11px] text-zinc-400">TDEE estimado (Mifflin-St Jeor): <span className="text-white">{tdee} kcal</span></span>
+            <span className="font-mono text-[11px] text-green-500">usar {suggestedKcal} kcal →</span>
+          </button>
+        )}
+
         <div className="grid grid-cols-2 gap-3">
           <Field label="Proteína (g/kg)" value={form.proteinPerKg} onChange={set("proteinPerKg")} type="number" />
           <Field label="Gordura (g/kg)" value={form.fatPerKg} onChange={set("fatPerKg")} type="number" />
@@ -1450,7 +1720,10 @@ function ProfileModal({ profile, onSave, onClose }) {
           <span>proteína: {proteinG}g · gordura: {fatG}g</span>
           <span className="text-green-600">carboidrato (calculado do restante): {carbsG}g</span>
         </div>
-        <button onClick={() => onSave({ ...form, heightCm: Number(form.heightCm) || 0, refWeight, kcal, proteinPerKg: Number(form.proteinPerKg) || 0, fatPerKg: Number(form.fatPerKg) || 0 })} className="mt-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] hover:brightness-110 transition">Salvar perfil</button>
+
+        <Field label="Meta de água diária (ml)" value={form.waterGoalMl} onChange={set("waterGoalMl")} type="number" />
+
+        <button onClick={() => onSave({ ...form, heightCm: Number(form.heightCm) || 0, refWeight, kcal, proteinPerKg: Number(form.proteinPerKg) || 0, fatPerKg: Number(form.fatPerKg) || 0, waterGoalMl: Number(form.waterGoalMl) || 0 })} className="mt-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] hover:brightness-110 transition">Salvar perfil</button>
       </div>
     </Modal>
   );
@@ -1480,7 +1753,7 @@ function Modal({ title, children, onClose }) {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<DiarioFit />);
+ReactDOM.createRoot(document.getElementById("root")).render(<AppRoot />);
 </script>
 <script>
   (function () {
