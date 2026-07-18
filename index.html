@@ -471,7 +471,7 @@ function AppRoot() {
   }
 
   if (activeProfileId) {
-    return <DiarioFit profileId={activeProfileId} onSwitchProfile={switchProfile} profileName={profiles.find((p) => p.id === activeProfileId)?.name || ""} />;
+    return <DiarioFit key={activeProfileId} profileId={activeProfileId} onSwitchProfile={switchProfile} profileName={profiles.find((p) => p.id === activeProfileId)?.name || ""} />;
   }
 
   return (
