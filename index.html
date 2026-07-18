@@ -723,7 +723,19 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
           />
         )}
         {tab === "evolucao" && <EvolucaoTab evolutionLog={evolutionLog} date={date} heightCm={profile.heightCm} onSave={saveEvolutionDay} onDelete={deleteEvolutionDay} />}
-        {tab === "checkin" && <CheckinTab date={date} foodLog={foodLog} trainingLog={trainingLog} evolutionLog={evolutionLog} kcalGoal={profile.kcal} profileName={profile.name || profileName} />}
+        {tab === "checkin" && (
+          <CheckinTab
+            date={date}
+            foodLog={foodLog}
+            trainingLog={trainingLog}
+            evolutionLog={evolutionLog}
+            kcalGoal={profile.kcal}
+            macroGoals={macroGoals}
+            waterLog={waterLog}
+            waterGoalMl={profile.waterGoalMl}
+            profileName={profile.name || profileName}
+          />
+        )}
       </main>
 
       {showProfile && <ProfileModal profile={profile} onSave={saveProfile} onClose={() => setShowProfile(false)} onSwitchProfile={onSwitchProfile} profileName={profileName} />}
@@ -823,13 +835,25 @@ function WaterWidget({ ml, goalMl, onAdd, onReset }) {
   );
 }
 
+const UNIT_OPTIONS = {
+  g: { label: "Gramas", gramsPerUnit: 1 },
+  unidade: { label: "Unidade", gramsPerUnit: 50 },
+  fatia: { label: "Fatia", gramsPerUnit: 30 },
+  colher_sopa: { label: "Colher de sopa", gramsPerUnit: 15 },
+  colher_cha: { label: "Colher de chá", gramsPerUnit: 5 },
+  xicara: { label: "Xícara", gramsPerUnit: 120 },
+  copo: { label: "Copo", gramsPerUnit: 200 },
+};
+
 function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFood, onRemoveCustomFood, recipes, onAddRecipe, onRemoveRecipe, onClose }) {
   const [mode, setMode] = useState(editing ? "manual" : "buscar");
 
   // busca
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(null);
-  const [grams, setGrams] = useState("100");
+  const [unit, setUnit] = useState("g");
+  const [qty, setQty] = useState("100");
+  const [gramsPerUnit, setGramsPerUnit] = useState(String(UNIT_OPTIONS["g"].gramsPerUnit));
   const allFoods = useMemo(() => [
     ...customFoods.map((f) => ({ ...f, custom: true })),
     ...FOOD_DB,
@@ -839,13 +863,15 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
     const q = normalize(query);
     return allFoods.filter((f) => normalize(f.name).includes(q)).slice(0, 20);
   }, [query, allFoods]);
-  const scale = (Number(grams) || 0) / 100;
+  const totalGrams = unit === "g" ? (Number(qty) || 0) : (Number(qty) || 0) * (Number(gramsPerUnit) || 0);
+  const scale = totalGrams / 100;
   const scaled = selected ? {
     kcal: Math.round(selected.kcal * scale),
     protein: Math.round(selected.protein * scale * 10) / 10,
     carbs: Math.round(selected.carbs * scale * 10) / 10,
     fat: Math.round(selected.fat * scale * 10) / 10,
   } : null;
+  const qtyLabel = unit === "g" ? `${Math.round(totalGrams)}g` : `${qty} ${UNIT_OPTIONS[unit].label.toLowerCase()}${Number(qty) > 1 ? "s" : ""} (~${Math.round(totalGrams)}g)`;
 
   // manual
   const [form, setForm] = useState(editing
@@ -912,11 +938,26 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
                 <span className="text-[14px] font-medium">{selected.name}</span>
                 <button onClick={() => setSelected(null)} className="text-zinc-500 hover:text-white"><X size={15} /></button>
               </div>
-              <Field label="Quantidade (g)" value={grams} onChange={(e) => setGrams(e.target.value)} type="number" />
+              <div className="grid grid-cols-2 gap-3">
+                <label className="flex flex-col gap-1">
+                  <span className="text-[11px] font-mono uppercase tracking-wider text-zinc-500">Medida</span>
+                  <select
+                    value={unit}
+                    onChange={(e) => { setUnit(e.target.value); setGramsPerUnit(String(UNIT_OPTIONS[e.target.value].gramsPerUnit)); }}
+                    className="bg-black border border-zinc-700 rounded-lg px-3 py-2 text-[14px] focus:outline-none focus:border-green-500"
+                  >
+                    {Object.entries(UNIT_OPTIONS).map(([k, u]) => <option key={k} value={k}>{u.label}</option>)}
+                  </select>
+                </label>
+                <Field label={unit === "g" ? "Quantidade (g)" : "Quantidade"} value={qty} onChange={(e) => setQty(e.target.value)} type="number" />
+              </div>
+              {unit !== "g" && (
+                <Field label={`Peso aproximado por ${UNIT_OPTIONS[unit].label.toLowerCase()} (g)`} value={gramsPerUnit} onChange={(e) => setGramsPerUnit(e.target.value)} type="number" />
+              )}
               <p className="font-mono text-[12px] text-zinc-400 bg-black border border-zinc-800 rounded-lg px-3 py-2">
-                {scaled.kcal} kcal · P {scaled.protein}g · C {scaled.carbs}g · G {scaled.fat}g
+                {qtyLabel} · {scaled.kcal} kcal · P {scaled.protein}g · C {scaled.carbs}g · G {scaled.fat}g
               </p>
-              <button onClick={() => { onAdd({ name: `${selected.name} (${grams}g)`, ...scaled }); onClose(); }} className="mt-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] transition">Lançar alimento</button>
+              <button onClick={() => { onAdd({ name: `${selected.name} (${qtyLabel})`, ...scaled }); onClose(); }} className="mt-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] transition">Lançar alimento</button>
             </>
           )}
         </div>
@@ -1520,15 +1561,38 @@ function MeasurementCarousel({ evolutionLog }) {
     </div>
   );
 }
-function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal, profileName }) {
+function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal, macroGoals, waterLog, waterGoalMl, profileName }) {
   const dates = weekDates(date);
 
   const kcalByDate = {};
+  const proteinByDate = {};
+  const carbsByDate = {};
+  const fatByDate = {};
   Object.entries(foodLog).forEach(([d, meals]) => {
     const items = Array.isArray(meals) ? meals : Object.values(meals || {}).flat();
     const sum = items.reduce((s, f) => s + Number(f.kcal || 0), 0);
-    if (sum > 0) kcalByDate[d] = sum;
+    if (sum > 0) {
+      kcalByDate[d] = sum;
+      proteinByDate[d] = items.reduce((s, f) => s + Number(f.protein || 0), 0);
+      carbsByDate[d] = items.reduce((s, f) => s + Number(f.carbs || 0), 0);
+      fatByDate[d] = items.reduce((s, f) => s + Number(f.fat || 0), 0);
+    }
   });
+
+  const weekAvg = (byDate, goal) => {
+    const days = dates.filter((d) => byDate[d] != null);
+    if (days.length === 0 || !goal) return { avg: 0, pct: 0, days: 0 };
+    const avg = days.reduce((s, d) => s + byDate[d], 0) / days.length;
+    return { avg: Math.round(avg * 10) / 10, pct: Math.round((avg / goal) * 100), days: days.length };
+  };
+  const proteinWeek = weekAvg(proteinByDate, macroGoals?.protein);
+  const carbsWeek = weekAvg(carbsByDate, macroGoals?.carbs);
+  const fatWeek = weekAvg(fatByDate, macroGoals?.fat);
+
+  const weekWaterDays = dates.filter((d) => waterLog?.[d] > 0);
+  const avgWater = weekWaterDays.length > 0 ? Math.round(weekWaterDays.reduce((s, d) => s + waterLog[d], 0) / weekWaterDays.length) : 0;
+  const waterPct = waterGoalMl > 0 ? Math.round((avgWater / waterGoalMl) * 100) : 0;
+
   const nutritionSuccessSet = new Set(
     Object.entries(kcalByDate).filter(([, k]) => Math.abs(k - kcalGoal) / kcalGoal <= 0.15).map(([d]) => d)
   );
@@ -1591,6 +1655,16 @@ function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal, profil
       <TrendCard title="Nutrição" current={avgKcal} goal={kcalGoal} unit="cal" weekDots={nutritionDots} successDays={nutritionSuccessDaysWeek} maxStreak={nutritionMaxStreak} />
       <TrendCard title="Treino" current={trainingSuccessDaysWeek} goal={7} unit="dias" weekDots={trainingDots} successDays={trainingSuccessDaysWeek} maxStreak={trainingMaxStreak} />
 
+      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+        <p className="text-[15px] font-medium mb-3">Comprometimento com macros e água</p>
+        <div className="flex flex-col gap-3">
+          <AdherenceRow label="Proteína" avg={proteinWeek.avg} goal={macroGoals?.protein} unit="g" pct={proteinWeek.pct} color="#22C55E" />
+          <AdherenceRow label="Carboidrato" avg={carbsWeek.avg} goal={macroGoals?.carbs} unit="g" pct={carbsWeek.pct} color="#16A34A" />
+          <AdherenceRow label="Gordura" avg={fatWeek.avg} goal={macroGoals?.fat} unit="g" pct={fatWeek.pct} color="#FFFFFF" />
+          <AdherenceRow label="Água" avg={avgWater} goal={waterGoalMl} unit="ml" pct={waterPct} color="#FFFFFF" />
+        </div>
+      </div>
+
       {weightDelta !== null && (
         <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-3.5 flex items-center justify-between">
           <span className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">Variação de peso na semana</span>
@@ -1603,6 +1677,21 @@ function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal, profil
           registre alimentos e treinos na semana para ver seu check-in
         </p>
       )}
+    </div>
+  );
+}
+
+function AdherenceRow({ label, avg, goal, unit, pct, color }) {
+  const barPct = Math.min(100, pct || 0);
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <span className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">{label}</span>
+        <span className="font-mono text-[12px] text-zinc-300">{avg}<span className="text-zinc-600">/{goal || 0}{unit}</span> · <span style={{ color }}>{pct || 0}%</span></span>
+      </div>
+      <div className="h-[6px] rounded-full bg-zinc-800 overflow-hidden">
+        <div className="h-full rounded-full transition-all duration-500" style={{ width: `${barPct}%`, background: color }} />
+      </div>
     </div>
   );
 }
