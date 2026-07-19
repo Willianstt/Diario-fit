@@ -153,31 +153,29 @@ function parseXmlAttrs(attrString) {
   return attrs;
 }
 
-function parseAppleHealthXml(xmlText) {
+function makeAppleHealthParser() {
   const dateOnly = (iso) => (iso || "").slice(0, 10);
-
-  const weightByDate = {};   // último valor do dia
+  const weightByDate = {};
   const stepsByDate = {};
   const kcalByDate = {};
-  const workoutsByDate = {}; // date -> [{name, durationMin}]
-
-  // varredura por regex em vez de montar a árvore XML inteira — exports
-  // do Apple Health costumam ter centenas de MB, e o DOMParser trava
-  // ou fica lento demais nesse tamanho.
-  const recordRe = /<Record\b([^>]*?)\/?>/g;
-  let m;
+  const workoutsByDate = {};
   let recordCount = 0;
-  while ((m = recordRe.exec(xmlText)) !== null) {
+  let buffer = "";
+  const SAFETY_TAIL = 4000; // margem generosa: nenhuma tag Record/Workout chega perto disso
+
+  const recordRe = /<Record\b([^>]*?)\/?>/g;
+  const workoutRe = /<Workout\b([^>]*?)>/g;
+
+  function handleRecord(attrStr) {
     recordCount++;
-    const attrs = parseXmlAttrs(m[1]);
+    const attrs = parseXmlAttrs(attrStr);
     const type = attrs.type;
     const date = dateOnly(attrs.startDate);
     const value = parseFloat(attrs.value);
-    if (!date || isNaN(value)) continue;
-
+    if (!date || isNaN(value)) return;
     if (type === "HKQuantityTypeIdentifierBodyMass") {
       const kg = attrs.unit === "lb" ? value * 0.453592 : value;
-      weightByDate[date] = Math.round(kg * 10) / 10; // fica com a última leitura do dia
+      weightByDate[date] = Math.round(kg * 10) / 10;
     } else if (type === "HKQuantityTypeIdentifierStepCount") {
       stepsByDate[date] = (stepsByDate[date] || 0) + value;
     } else if (type === "HKQuantityTypeIdentifierActiveEnergyBurned") {
@@ -185,20 +183,74 @@ function parseAppleHealthXml(xmlText) {
     }
   }
 
-  const workoutRe = /<Workout\b([^>]*?)>/g;
-  while ((m = workoutRe.exec(xmlText)) !== null) {
-    const attrs = parseXmlAttrs(m[1]);
+  function handleWorkout(attrStr) {
+    const attrs = parseXmlAttrs(attrStr);
     const date = dateOnly(attrs.startDate);
-    const activityType = attrs.workoutActivityType;
     const durationRaw = parseFloat(attrs.duration);
-    if (!date || isNaN(durationRaw)) continue;
+    if (!date || isNaN(durationRaw)) return;
     const durationMin = attrs.durationUnit === "sec" ? Math.round(durationRaw / 60) : Math.round(durationRaw);
-    const label = WORKOUT_TYPE_LABELS[activityType] || "Treino";
+    const label = WORKOUT_TYPE_LABELS[attrs.workoutActivityType] || "Treino";
     if (!workoutsByDate[date]) workoutsByDate[date] = [];
     workoutsByDate[date].push({ name: `${label} (Apple Watch)`, durationMin });
   }
 
-  return { weightByDate, stepsByDate, kcalByDate, workoutsByDate, recordCount };
+  // processa um pedaço novo de texto; só "consome" (descarta) o que já
+  // foi processado com segurança, mantendo uma margem no fim caso uma
+  // tag tenha sido cortada bem na fronteira entre dois pedaços do arquivo
+  function feed(chunkText, isFinal) {
+    buffer += chunkText;
+    const safeEnd = isFinal ? buffer.length : Math.max(0, buffer.length - SAFETY_TAIL);
+    const region = buffer.slice(0, safeEnd);
+
+    let lastConsumed = 0;
+    recordRe.lastIndex = 0;
+    let m;
+    while ((m = recordRe.exec(region)) !== null) {
+      handleRecord(m[1]);
+      lastConsumed = Math.max(lastConsumed, recordRe.lastIndex);
+    }
+    workoutRe.lastIndex = 0;
+    while ((m = workoutRe.exec(region)) !== null) {
+      handleWorkout(m[1]);
+      lastConsumed = Math.max(lastConsumed, workoutRe.lastIndex);
+    }
+
+    buffer = buffer.slice(lastConsumed);
+  }
+
+  function result() {
+    return { weightByDate, stepsByDate, kcalByDate, workoutsByDate, recordCount };
+  }
+
+  return { feed, result };
+}
+
+async function parseAppleHealthFileStreaming(file, onProgress) {
+  const parser = makeAppleHealthParser();
+
+  if (!file.stream) {
+    // fallback pra navegadores sem File.stream() — lê tudo de uma vez
+    const text = await file.text();
+    parser.feed(text, true);
+    return parser.result();
+  }
+
+  const reader = file.stream().getReader();
+  const decoder = new TextDecoder("utf-8");
+  let bytesRead = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      parser.feed(decoder.decode(), true);
+      break;
+    }
+    bytesRead += value.length;
+    if (onProgress) onProgress(bytesRead, file.size);
+    parser.feed(decoder.decode(value, { stream: true }), false);
+  }
+
+  return parser.result();
 }
 
 function navyBodyFat({ neck, waist, heightCm }) {
@@ -695,8 +747,8 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
     setEvolutionLog(next); await storeSet(pk("evolution-log"), next);
   };
 
-  const importAppleHealth = async (xmlText) => {
-    const { weightByDate, stepsByDate, kcalByDate, workoutsByDate, recordCount } = parseAppleHealthXml(xmlText);
+  const importAppleHealth = async (file, onProgress) => {
+    const { weightByDate, stepsByDate, kcalByDate, workoutsByDate, recordCount } = await parseAppleHealthFileStreaming(file, onProgress);
 
     // peso: só preenche dias que ainda não têm peso lançado manualmente
     const nextEvo = { ...evolutionLog };
@@ -1709,6 +1761,7 @@ function MeasurementCarousel({ evolutionLog }) {
 function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal, macroGoals, waterLog, waterGoalMl, activityLog, stepsGoal, onImportAppleHealth, profileName }) {
   const healthFileRef = useRef(null);
   const [importStatus, setImportStatus] = useState(null); // null | "loading" | result | "error" | "empty"
+  const [importProgress, setImportProgress] = useState(0);
 
   const handleHealthImport = async (e) => {
     const file = e.target.files?.[0];
@@ -1718,9 +1771,11 @@ function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal, macroG
       return;
     }
     setImportStatus("loading");
+    setImportProgress(0);
     try {
-      const text = await file.text();
-      const result = await onImportAppleHealth(text);
+      const result = await onImportAppleHealth(file, (bytesRead, totalBytes) => {
+        if (totalBytes) setImportProgress(Math.round((bytesRead / totalBytes) * 100));
+      });
       if (!result.recordCount) {
         setImportStatus("empty");
       } else {
@@ -1830,7 +1885,7 @@ function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal, macroG
         </div>
       </div>
 
-      {importStatus === "loading" && <p className="font-mono text-[12px] text-zinc-500">processando export.xml… (pode demorar um pouco em arquivos grandes)</p>}
+      {importStatus === "loading" && <p className="font-mono text-[12px] text-zinc-500">processando export.xml… {importProgress > 0 ? `${importProgress}%` : ""}</p>}
       {importStatus === "error" && <p className="font-mono text-[12px] text-white bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">arquivo inválido — descompacte o .zip do app Saúde e selecione o export.xml de dentro dele</p>}
       {importStatus === "empty" && <p className="font-mono text-[12px] text-white bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">o arquivo abriu, mas não encontrei nenhum registro reconhecível — confirma que é o export.xml (não o export_cda.xml, que é outro arquivo dentro do mesmo zip)</p>}
       {importStatus && !["loading", "error", "empty"].includes(importStatus) && (
