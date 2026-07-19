@@ -125,6 +125,71 @@ function weekDates(dateStr) {
   return dates;
 }
 
+const WORKOUT_TYPE_LABELS = {
+  HKWorkoutActivityTypeRunning: "Corrida",
+  HKWorkoutActivityTypeWalking: "Caminhada",
+  HKWorkoutActivityTypeCycling: "Ciclismo",
+  HKWorkoutActivityTypeFunctionalStrengthTraining: "Treino funcional",
+  HKWorkoutActivityTypeTraditionalStrengthTraining: "Musculação",
+  HKWorkoutActivityTypeCoreTraining: "Treino de core",
+  HKWorkoutActivityTypeHighIntensityIntervalTraining: "HIIT",
+  HKWorkoutActivityTypeSwimming: "Natação",
+  HKWorkoutActivityTypeYoga: "Yoga",
+  HKWorkoutActivityTypeSoccer: "Futebol",
+  HKWorkoutActivityTypeBasketball: "Basquete",
+  HKWorkoutActivityTypeElliptical: "Elíptico",
+  HKWorkoutActivityTypeRowing: "Remo",
+  HKWorkoutActivityTypeStairClimbing: "Escada",
+  HKWorkoutActivityTypeOther: "Treino",
+};
+
+function parseAppleHealthXml(xmlText) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlText, "text/xml");
+
+  const dateOnly = (iso) => (iso || "").slice(0, 10);
+
+  const weightByDate = {};   // último valor do dia
+  const stepsByDate = {};
+  const kcalByDate = {};
+  const workoutsByDate = {}; // date -> [{name, durationMin}]
+
+  const records = doc.getElementsByTagName("Record");
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    const type = r.getAttribute("type");
+    const date = dateOnly(r.getAttribute("startDate"));
+    const value = parseFloat(r.getAttribute("value"));
+    if (!date || isNaN(value)) continue;
+
+    if (type === "HKQuantityTypeIdentifierBodyMass") {
+      const unit = r.getAttribute("unit");
+      const kg = unit === "lb" ? value * 0.453592 : value;
+      weightByDate[date] = Math.round(kg * 10) / 10; // fica com a última leitura do dia
+    } else if (type === "HKQuantityTypeIdentifierStepCount") {
+      stepsByDate[date] = (stepsByDate[date] || 0) + value;
+    } else if (type === "HKQuantityTypeIdentifierActiveEnergyBurned") {
+      kcalByDate[date] = (kcalByDate[date] || 0) + value;
+    }
+  }
+
+  const workouts = doc.getElementsByTagName("Workout");
+  for (let i = 0; i < workouts.length; i++) {
+    const w = workouts[i];
+    const date = dateOnly(w.getAttribute("startDate"));
+    const activityType = w.getAttribute("workoutActivityType");
+    const durationRaw = parseFloat(w.getAttribute("duration"));
+    const durationUnit = w.getAttribute("durationUnit");
+    if (!date || isNaN(durationRaw)) continue;
+    const durationMin = durationUnit === "sec" ? Math.round(durationRaw / 60) : Math.round(durationRaw);
+    const label = WORKOUT_TYPE_LABELS[activityType] || "Treino";
+    if (!workoutsByDate[date]) workoutsByDate[date] = [];
+    workoutsByDate[date].push({ name: `${label} (Apple Watch)`, durationMin });
+  }
+
+  return { weightByDate, stepsByDate, kcalByDate, workoutsByDate };
+}
+
 function navyBodyFat({ neck, waist, heightCm }) {
   const n = Number(neck), w = Number(waist), h = Number(heightCm);
   if (!n || !w || !h || w <= n) return null;
@@ -521,6 +586,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
   const [evolutionLog, setEvolutionLog] = useState({});
   const [waterLog, setWaterLog] = useState({});
   const [recipes, setRecipes] = useState([]);
+  const [activityLog, setActivityLog] = useState({});
 
   const [showProfile, setShowProfile] = useState(false);
   const [addFoodCtx, setAddFoodCtx] = useState(null); // { mealId, editing } | null
@@ -528,7 +594,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
 
   useEffect(() => {
     (async () => {
-      const [p, f, cf, pl, tl, ce, el, wl, rc] = await Promise.all([
+      const [p, f, cf, pl, tl, ce, el, wl, rc, al] = await Promise.all([
         storeGet(pk("profile-goals"), DEFAULT_PROFILE),
         storeGet(pk("food-log"), {}),
         storeGet(pk("custom-foods"), []),
@@ -538,6 +604,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
         storeGet(pk("evolution-log"), {}),
         storeGet(pk("water-log"), {}),
         storeGet(pk("recipes"), []),
+        storeGet(pk("activity-log"), {}),
       ]);
       setProfile({ ...DEFAULT_PROFILE, ...p });
       setFoodLog(f);
@@ -548,6 +615,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
       setEvolutionLog(el);
       setWaterLog(wl);
       setRecipes(rc);
+      setActivityLog(al);
       setLoading(false);
     })();
   }, []);
@@ -614,6 +682,51 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
     const next = { ...evolutionLog };
     delete next[date];
     setEvolutionLog(next); await storeSet(pk("evolution-log"), next);
+  };
+
+  const importAppleHealth = async (xmlText) => {
+    const { weightByDate, stepsByDate, kcalByDate, workoutsByDate } = parseAppleHealthXml(xmlText);
+
+    // peso: só preenche dias que ainda não têm peso lançado manualmente
+    const nextEvo = { ...evolutionLog };
+    let weightAdded = 0;
+    Object.entries(weightByDate).forEach(([d, w]) => {
+      if (!nextEvo[d] || nextEvo[d].weight == null) {
+        nextEvo[d] = { ...(nextEvo[d] || {}), weight: w };
+        weightAdded++;
+      }
+    });
+
+    // atividade: passos e calorias ativas, substitui pelo valor mais recente da importação
+    const nextActivity = { ...activityLog };
+    const activityDates = new Set([...Object.keys(stepsByDate), ...Object.keys(kcalByDate)]);
+    activityDates.forEach((d) => {
+      nextActivity[d] = {
+        steps: stepsByDate[d] != null ? Math.round(stepsByDate[d]) : (nextActivity[d]?.steps ?? null),
+        activeKcal: kcalByDate[d] != null ? Math.round(kcalByDate[d]) : (nextActivity[d]?.activeKcal ?? null),
+      };
+    });
+
+    // treinos: adiciona como avulso, evitando duplicar se já importado antes
+    const nextTraining = { ...trainingLog };
+    let workoutsAdded = 0;
+    Object.entries(workoutsByDate).forEach(([d, list]) => {
+      const day = nextTraining[d] || { planId: null, progress: {}, adhoc: [] };
+      const existingNames = new Set((day.adhoc || []).map((a) => a.name));
+      const newOnes = list
+        .filter((w) => !existingNames.has(w.name))
+        .map((w) => ({ id: uid(), name: w.name, sets: 0, reps: 0, weight: 0, durationMin: w.durationMin }));
+      if (newOnes.length > 0) {
+        nextTraining[d] = { ...day, adhoc: [...(day.adhoc || []), ...newOnes] };
+        workoutsAdded += newOnes.length;
+      }
+    });
+
+    setEvolutionLog(nextEvo); await storeSet(pk("evolution-log"), nextEvo);
+    setActivityLog(nextActivity); await storeSet(pk("activity-log"), nextActivity);
+    setTrainingLog(nextTraining); await storeSet(pk("training-log"), nextTraining);
+
+    return { weightAdded, workoutsAdded, activityDays: activityDates.size };
   };
 
   const dayWaterMl = waterLog[date] || 0;
@@ -722,7 +835,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
             onManagePlans={() => setShowPlanManager(true)}
           />
         )}
-        {tab === "evolucao" && <EvolucaoTab evolutionLog={evolutionLog} date={date} heightCm={profile.heightCm} onSave={saveEvolutionDay} onDelete={deleteEvolutionDay} />}
+        {tab === "evolucao" && <EvolucaoTab evolutionLog={evolutionLog} date={date} heightCm={profile.heightCm} onSave={saveEvolutionDay} onDelete={deleteEvolutionDay} activityLog={activityLog} onImportAppleHealth={importAppleHealth} />}
         {tab === "checkin" && (
           <CheckinTab
             date={date}
@@ -1117,7 +1230,7 @@ function TreinoTab({ plans, dayData, fullTrainingLog, customExercises, onSaveCus
         {adhoc.length === 0 && <p className="py-6 text-center text-[13px] text-zinc-500 font-mono">nada avulso hoje</p>}
         {adhoc.map((w) => (
           <div key={w.id} className="flex items-center justify-between py-3 group">
-            <div><p className="text-[14px] font-medium">{w.name}</p><p className="text-[11px] font-mono text-zinc-500">{w.sets}x{w.reps} · {w.weight}kg</p></div>
+            <div><p className="text-[14px] font-medium">{w.name}</p><p className="text-[11px] font-mono text-zinc-500">{w.durationMin != null ? `${w.durationMin} min` : `${w.sets}x${w.reps} · ${w.weight}kg`}</p></div>
             <button onClick={() => removeAdhoc(w.id)} className="text-zinc-500 active:text-white transition p-1"><Trash2 size={15} /></button>
           </div>
         ))}
@@ -1331,7 +1444,7 @@ function PlanManagerModal({ plans, onChange, onClose }) {
 }
 
 // ---------- Evolução ----------
-function EvolucaoTab({ evolutionLog, date, heightCm, onSave, onDelete }) {
+function EvolucaoTab({ evolutionLog, date, heightCm, onSave, onDelete, activityLog, onImportAppleHealth }) {
   const entry = evolutionLog[date] || {};
   const [weight, setWeight] = useState(entry.weight || "");
   const [neck, setNeck] = useState(entry.neck || "");
@@ -1344,6 +1457,26 @@ function EvolucaoTab({ evolutionLog, date, heightCm, onSave, onDelete }) {
   const [notes, setNotes] = useState(entry.notes || "");
   const [photo, setPhoto] = useState(entry.photo || null);
   const fileRef = useRef(null);
+  const healthFileRef = useRef(null);
+  const [importStatus, setImportStatus] = useState(null); // null | "loading" | { weightAdded, workoutsAdded, activityDays } | "error"
+
+  const handleHealthImport = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".xml")) {
+      setImportStatus("error");
+      return;
+    }
+    setImportStatus("loading");
+    try {
+      const text = await file.text();
+      const result = await onImportAppleHealth(text);
+      setImportStatus(result);
+    } catch (err) {
+      console.error(err);
+      setImportStatus("error");
+    }
+  };
 
   useEffect(() => {
     const e = evolutionLog[date] || {};
@@ -1376,8 +1509,42 @@ function EvolucaoTab({ evolutionLog, date, heightCm, onSave, onDelete }) {
 
   return (
     <div className="pt-6">
-      <h2 className="font-display text-xl font-semibold tracking-tight">Medidas de hoje</h2>
-      <div className="mt-4 grid grid-cols-3 gap-3">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="font-display text-xl font-semibold tracking-tight">Medidas de hoje</h2>
+        <div>
+          <input ref={healthFileRef} type="file" accept=".xml" onChange={handleHealthImport} className="hidden" />
+          <button onClick={() => healthFileRef.current?.click()} className="font-mono text-[11px] text-zinc-400 border border-zinc-700 rounded-lg px-2.5 py-1.5 hover:text-white transition">
+            importar Apple Health
+          </button>
+        </div>
+      </div>
+
+      {importStatus === "loading" && <p className="mb-4 font-mono text-[12px] text-zinc-500">processando export.xml…</p>}
+      {importStatus === "error" && <p className="mb-4 font-mono text-[12px] text-white bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">arquivo inválido — selecione o export.xml de dentro do .zip exportado pelo app Saúde</p>}
+      {importStatus && importStatus !== "loading" && importStatus !== "error" && (
+        <p className="mb-4 font-mono text-[12px] text-green-500 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">
+          importado: {importStatus.weightAdded} pesos · {importStatus.workoutsAdded} treinos · {importStatus.activityDays} dias de atividade
+        </p>
+      )}
+
+      {activityLog[date] && (activityLog[date].steps != null || activityLog[date].activeKcal != null) && (
+        <div className="mb-4 grid grid-cols-2 gap-3">
+          {activityLog[date].steps != null && (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">
+              <p className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Passos</p>
+              <p className="font-mono text-lg font-semibold">{activityLog[date].steps.toLocaleString("pt-BR")}</p>
+            </div>
+          )}
+          {activityLog[date].activeKcal != null && (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">
+              <p className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Kcal ativas</p>
+              <p className="font-mono text-lg font-semibold">{activityLog[date].activeKcal}</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="grid grid-cols-3 gap-3">
         <Field label="Peso (kg)" value={weight} onChange={(e) => setWeight(e.target.value)} type="number" />
         <Field label="Pescoço (cm)" value={neck} onChange={(e) => setNeck(e.target.value)} type="number" />
         <Field label="Cintura (cm)" value={waist} onChange={(e) => setWaist(e.target.value)} type="number" />
