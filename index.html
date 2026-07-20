@@ -60,7 +60,7 @@ function MiniLineChart({ data, dataKey, color, height = 150 }) {
   const width = 600;
   const padding = { top: 10, right: 10, bottom: 20, left: 8 };
   if (!data || data.length === 0) return null;
-  const values = data.map((d) => Number(d[dataKey]));
+  const values = data.map((d) => toNum(d[dataKey]));
   const min = Math.min(...values);
   const max = Math.max(...values);
   const range = max - min || 1;
@@ -68,7 +68,7 @@ function MiniLineChart({ data, dataKey, color, height = 150 }) {
   const innerH = height - padding.top - padding.bottom;
   const points = data.map((d, i) => {
     const x = padding.left + (data.length > 1 ? (i / (data.length - 1)) * innerW : innerW / 2);
-    const y = padding.top + innerH - ((Number(d[dataKey]) - min) / range) * innerH;
+    const y = padding.top + innerH - ((toNum(d[dataKey]) - min) / range) * innerH;
     return [x, y];
   });
   const pathD = points.map((p, i) => `${i === 0 ? "M" : "L"} ${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(" ");
@@ -96,6 +96,13 @@ const fmtDateLabel = (d) => {
 const fmtShort = (d) => d.slice(5);
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const uid = () => Math.random().toString(36).slice(2, 10);
+// aceita "2,2" ou "2.2" — teclado numérico brasileiro usa vírgula, e
+// toNum() sozinho retorna NaN pra vírgula, o que colapsava pra 0
+const toNum = (v) => {
+  if (v === null || v === undefined || v === "") return 0;
+  const n = Number(String(v).replace(",", "."));
+  return isNaN(n) ? 0 : n;
+};
 
 const DEFAULT_PROFILE = { name: "", age: "", sex: "masculino", goal: "manutencao", activityLevel: "moderado", heightCm: 175, refWeight: 80, kcal: 2400, proteinPerKg: 2.0, fatPerKg: 0.9, waterGoalMl: 3000, stepsGoal: "" };
 
@@ -103,7 +110,7 @@ const ACTIVITY_MULTIPLIERS = { sedentario: 1.2, leve: 1.375, moderado: 1.55, int
 const GOAL_ADJUSTMENTS = { perda: -500, manutencao: 0, ganho: 300 };
 
 function calcTdee({ sex, refWeight, heightCm, age, activityLevel }) {
-  const w = Number(refWeight), h = Number(heightCm), a = Number(age);
+  const w = toNum(refWeight), h = toNum(heightCm), a = toNum(age);
   if (!w || !h || !a) return null;
   const bmr = sex === "feminino" ? 10 * w + 6.25 * h - 5 * a - 161 : 10 * w + 6.25 * h - 5 * a + 5;
   const mult = ACTIVITY_MULTIPLIERS[activityLevel] || 1.55;
@@ -254,7 +261,7 @@ async function parseAppleHealthFileStreaming(file, onProgress) {
 }
 
 function navyBodyFat({ neck, waist, heightCm }) {
-  const n = Number(neck), w = Number(waist), h = Number(heightCm);
+  const n = toNum(neck), w = toNum(waist), h = toNum(heightCm);
   if (!n || !w || !h || w <= n) return null;
   const bf = 495 / (1.0324 - 0.19077 * Math.log10(w - n) + 0.15456 * Math.log10(h)) - 450;
   if (!isFinite(bf) || bf <= 0 || bf > 60) return null;
@@ -268,7 +275,7 @@ function buildExerciseHistory(trainingLog, plans) {
   Object.entries(trainingLog).forEach(([date, day]) => {
     if (day.progress) {
       Object.entries(day.progress).forEach(([exId, data]) => {
-        const w = Number(data.weight);
+        const w = toNum(data.weight);
         if (!w) return;
         const name = idToName[exId] || exId;
         if (!history[name]) history[name] = [];
@@ -276,7 +283,7 @@ function buildExerciseHistory(trainingLog, plans) {
       });
     }
     (day.adhoc || []).forEach((a) => {
-      const w = Number(a.weight);
+      const w = toNum(a.weight);
       if (!w) return;
       if (!history[a.name]) history[a.name] = [];
       history[a.name].push({ date, weight: w });
@@ -708,10 +715,10 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
   const totals = useMemo(() => {
     const allFoods = Object.values(dayMeals).flat();
     return allFoods.reduce((acc, f) => ({
-      kcal: acc.kcal + Number(f.kcal || 0),
-      protein: acc.protein + Number(f.protein || 0),
-      carbs: acc.carbs + Number(f.carbs || 0),
-      fat: acc.fat + Number(f.fat || 0),
+      kcal: acc.kcal + toNum(f.kcal || 0),
+      protein: acc.protein + toNum(f.protein || 0),
+      carbs: acc.carbs + toNum(f.carbs || 0),
+      fat: acc.fat + toNum(f.fat || 0),
     }), { kcal: 0, protein: 0, carbs: 0, fat: 0 });
   }, [dayMeals]);
 
@@ -966,7 +973,7 @@ function NutricaoTab({ totals, goals, dayMeals, onRemove, onAdd, onEdit, waterMl
       <div className="mt-8 flex flex-col gap-6">
         {MEALS.map((meal) => {
           const items = dayMeals[meal.id] || [];
-          const mealKcal = items.reduce((s, f) => s + Number(f.kcal || 0), 0);
+          const mealKcal = items.reduce((s, f) => s + toNum(f.kcal || 0), 0);
           return (
             <div key={meal.id}>
               <div className="flex items-center justify-between">
@@ -1055,7 +1062,7 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
     const q = normalize(query);
     return allFoods.filter((f) => normalize(f.name).includes(q)).slice(0, 20);
   }, [query, allFoods]);
-  const totalGrams = unit === "g" ? (Number(qty) || 0) : (Number(qty) || 0) * (Number(gramsPerUnit) || 0);
+  const totalGrams = unit === "g" ? (toNum(qty) || 0) : (toNum(qty) || 0) * (toNum(gramsPerUnit) || 0);
   const scale = totalGrams / 100;
   const scaled = selected ? {
     kcal: Math.round(selected.kcal * scale),
@@ -1063,7 +1070,7 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
     carbs: Math.round(selected.carbs * scale * 10) / 10,
     fat: Math.round(selected.fat * scale * 10) / 10,
   } : null;
-  const qtyLabel = unit === "g" ? `${Math.round(totalGrams)}g` : `${qty} ${UNIT_OPTIONS[unit].label.toLowerCase()}${Number(qty) > 1 ? "s" : ""} (~${Math.round(totalGrams)}g)`;
+  const qtyLabel = unit === "g" ? `${Math.round(totalGrams)}g` : `${qty} ${UNIT_OPTIONS[unit].label.toLowerCase()}${toNum(qty) > 1 ? "s" : ""} (~${Math.round(totalGrams)}g)`;
 
   // manual
   const [form, setForm] = useState(editing
@@ -1087,7 +1094,7 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
         <div className="flex flex-col gap-1 max-h-[50vh] overflow-y-auto">
           {(!recipes || recipes.length === 0) && <p className="text-center text-[13px] text-zinc-500 font-mono py-6">nenhuma receita salva ainda — salve uma refeição em "Nutrição" pra ela aparecer aqui</p>}
           {recipes && recipes.map((r) => {
-            const totalKcal = r.items.reduce((s, it) => s + Number(it.kcal || 0), 0);
+            const totalKcal = r.items.reduce((s, it) => s + toNum(it.kcal || 0), 0);
             return (
               <div key={r.id} className="flex items-center gap-1">
                 <button
@@ -1171,7 +1178,7 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
           <button
             disabled={!manualValid}
             onClick={() => {
-              const food = { name: form.name.trim(), kcal: Number(form.kcal) || 0, protein: Number(form.protein) || 0, carbs: Number(form.carbs) || 0, fat: Number(form.fat) || 0 };
+              const food = { name: form.name.trim(), kcal: toNum(form.kcal) || 0, protein: toNum(form.protein) || 0, carbs: toNum(form.carbs) || 0, fat: toNum(form.fat) || 0 };
               if (editing) {
                 onSaveEdit(food);
               } else {
@@ -1289,7 +1296,7 @@ function TreinoTab({ plans, dayData, fullTrainingLog, customExercises, onSaveCus
                         ))}
                       </div>
                       <div className="flex items-center gap-2">
-                        <input type="number" placeholder="kg" value={progress[ex.id]?.weight || ""} onChange={(e) => setExerciseWeight(ex.id, e.target.value)} className="w-16 bg-black border border-zinc-700 rounded-md px-2 py-1 text-[13px] font-mono focus:outline-none focus:border-green-500" />
+                        <input type="text" inputMode="decimal" placeholder="kg" value={progress[ex.id]?.weight || ""} onChange={(e) => setExerciseWeight(ex.id, e.target.value)} className="w-16 bg-black border border-zinc-700 rounded-md px-2 py-1 text-[13px] font-mono focus:outline-none focus:border-green-500" />
                         {ex.restSeconds > 0 && <RestTimer seconds={ex.restSeconds} />}
                       </div>
                     </div>
@@ -1440,7 +1447,7 @@ function AddExerciseModal({ onAdd, onClose, exerciseHistory, customExercises, on
           <button
             disabled={!valid}
             onClick={() => {
-              const ex = { name: form.name.trim(), sets: Number(form.sets) || 0, reps: Number(form.reps) || 0, weight: Number(form.weight) || 0 };
+              const ex = { name: form.name.trim(), sets: toNum(form.sets) || 0, reps: toNum(form.reps) || 0, weight: toNum(form.weight) || 0 };
               onAdd(ex);
               onSaveCustomExercise(ex.name);
               onClose();
@@ -1469,7 +1476,7 @@ function PlanManagerModal({ plans, onChange, onClose }) {
   const removePlan = (id) => onChange(plans.filter((p) => p.id !== id));
   const addExercise = (planId) => {
     if (!exForm.name.trim()) return;
-    const next = plans.map((p) => p.id === planId ? { ...p, exercises: [...p.exercises, { id: uid(), name: exForm.name.trim(), sets: Number(exForm.sets) || 0, reps: Number(exForm.reps) || 0, restSeconds: Number(exForm.restSeconds) || 0 }] } : p);
+    const next = plans.map((p) => p.id === planId ? { ...p, exercises: [...p.exercises, { id: uid(), name: exForm.name.trim(), sets: toNum(exForm.sets) || 0, reps: toNum(exForm.reps) || 0, restSeconds: toNum(exForm.restSeconds) || 0 }] } : p);
     onChange(next);
     setExForm({ name: "", sets: "3", reps: "10", restSeconds: "60" });
   };
@@ -1507,9 +1514,9 @@ function PlanManagerModal({ plans, onChange, onClose }) {
                   ))}
                   <div className="grid grid-cols-2 gap-2 mt-1">
                     <input value={exForm.name} onChange={(e) => setExForm({ ...exForm, name: e.target.value })} placeholder="Exercício" className="col-span-2 bg-black border border-zinc-700 rounded-md px-2 py-1.5 text-[13px] focus:outline-none focus:border-green-600" />
-                    <input type="number" value={exForm.sets} onChange={(e) => setExForm({ ...exForm, sets: e.target.value })} placeholder="Séries" className="bg-black border border-zinc-700 rounded-md px-2 py-1.5 text-[13px] font-mono" />
-                    <input type="number" value={exForm.reps} onChange={(e) => setExForm({ ...exForm, reps: e.target.value })} placeholder="Reps" className="bg-black border border-zinc-700 rounded-md px-2 py-1.5 text-[13px] font-mono" />
-                    <input type="number" value={exForm.restSeconds} onChange={(e) => setExForm({ ...exForm, restSeconds: e.target.value })} placeholder="Descanso (s)" className="col-span-2 bg-black border border-zinc-700 rounded-md px-2 py-1.5 text-[13px] font-mono" />
+                    <input type="text" inputMode="decimal" value={exForm.sets} onChange={(e) => setExForm({ ...exForm, sets: e.target.value })} placeholder="Séries" className="bg-black border border-zinc-700 rounded-md px-2 py-1.5 text-[13px] font-mono" />
+                    <input type="text" inputMode="decimal" value={exForm.reps} onChange={(e) => setExForm({ ...exForm, reps: e.target.value })} placeholder="Reps" className="bg-black border border-zinc-700 rounded-md px-2 py-1.5 text-[13px] font-mono" />
+                    <input type="text" inputMode="decimal" value={exForm.restSeconds} onChange={(e) => setExForm({ ...exForm, restSeconds: e.target.value })} placeholder="Descanso (s)" className="col-span-2 bg-black border border-zinc-700 rounded-md px-2 py-1.5 text-[13px] font-mono" />
                   </div>
                   <button onClick={() => addExercise(p.id)} className="mt-1 bg-green-600 text-black font-semibold rounded-lg py-2 text-[13px]">Adicionar exercício</button>
                 </div>
@@ -1554,7 +1561,7 @@ function EvolucaoTab({ evolutionLog, date, heightCm, onSave, onDelete, activityL
   };
 
   const save = () => {
-    onSave({ weight: Number(weight) || null, neck: Number(neck) || null, waist: Number(waist) || null, chest: Number(chest) || null, hip: Number(hip) || null, arm: Number(arm) || null, thigh: Number(thigh) || null, bodyFat: bodyFatPreview, notes, photo });
+    onSave({ weight: toNum(weight) || null, neck: toNum(neck) || null, waist: toNum(waist) || null, chest: toNum(chest) || null, hip: toNum(hip) || null, arm: toNum(arm) || null, thigh: toNum(thigh) || null, bodyFat: bodyFatPreview, notes, photo });
   };
 
   const sortedEntries = Object.entries(evolutionLog).sort(([a], [b]) => a.localeCompare(b));
@@ -1808,12 +1815,12 @@ function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal, macroG
   const fatByDate = {};
   Object.entries(foodLog).forEach(([d, meals]) => {
     const items = Array.isArray(meals) ? meals : Object.values(meals || {}).flat();
-    const sum = items.reduce((s, f) => s + Number(f.kcal || 0), 0);
+    const sum = items.reduce((s, f) => s + toNum(f.kcal || 0), 0);
     if (sum > 0) {
       kcalByDate[d] = sum;
-      proteinByDate[d] = items.reduce((s, f) => s + Number(f.protein || 0), 0);
-      carbsByDate[d] = items.reduce((s, f) => s + Number(f.carbs || 0), 0);
-      fatByDate[d] = items.reduce((s, f) => s + Number(f.fat || 0), 0);
+      proteinByDate[d] = items.reduce((s, f) => s + toNum(f.protein || 0), 0);
+      carbsByDate[d] = items.reduce((s, f) => s + toNum(f.carbs || 0), 0);
+      fatByDate[d] = items.reduce((s, f) => s + toNum(f.fat || 0), 0);
     }
   });
 
@@ -1993,10 +2000,10 @@ function TrendCard({ title, current, goal, unit, weekDots, successDays, maxStrea
 function ProfileModal({ profile, onSave, onClose, onSwitchProfile, profileName }) {
   const [form, setForm] = useState(profile);
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
-  const refWeight = Number(form.refWeight) || 0;
-  const kcal = Number(form.kcal) || 0;
-  const proteinG = Math.round((Number(form.proteinPerKg) || 0) * refWeight);
-  const fatG = Math.round((Number(form.fatPerKg) || 0) * refWeight);
+  const refWeight = toNum(form.refWeight) || 0;
+  const kcal = toNum(form.kcal) || 0;
+  const proteinG = Math.round((toNum(form.proteinPerKg) || 0) * refWeight);
+  const fatG = Math.round((toNum(form.fatPerKg) || 0) * refWeight);
   const carbsG = Math.max(0, Math.round((kcal - proteinG * 4 - fatG * 9) / 4));
 
   const tdee = calcTdee(form);
@@ -2069,7 +2076,7 @@ function ProfileModal({ profile, onSave, onClose, onSwitchProfile, profileName }
         <Field label="Meta de água diária (ml)" value={form.waterGoalMl} onChange={set("waterGoalMl")} type="number" />
         <Field label="Meta de passos diária (opcional)" value={form.stepsGoal} onChange={set("stepsGoal")} type="number" placeholder="ex: 8000" />
 
-        <button onClick={() => onSave({ ...form, heightCm: Number(form.heightCm) || 0, refWeight, kcal, proteinPerKg: Number(form.proteinPerKg) || 0, fatPerKg: Number(form.fatPerKg) || 0, waterGoalMl: Number(form.waterGoalMl) || 0, stepsGoal: form.stepsGoal === "" ? "" : Number(form.stepsGoal) || 0 })} className="mt-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] hover:brightness-110 transition">Salvar perfil</button>
+        <button onClick={() => onSave({ ...form, heightCm: toNum(form.heightCm) || 0, refWeight, kcal, proteinPerKg: toNum(form.proteinPerKg) || 0, fatPerKg: toNum(form.fatPerKg) || 0, waterGoalMl: toNum(form.waterGoalMl) || 0, stepsGoal: form.stepsGoal === "" ? "" : toNum(form.stepsGoal) || 0 })} className="mt-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] hover:brightness-110 transition">Salvar perfil</button>
       </div>
     </Modal>
   );
@@ -2077,10 +2084,18 @@ function ProfileModal({ profile, onSave, onClose, onSwitchProfile, profileName }
 
 // ---------- shared ----------
 function Field({ label, value, onChange, type = "text", placeholder }) {
+  const isNumeric = type === "number";
   return (
     <label className="flex flex-col gap-1">
       <span className="text-[11px] font-mono uppercase tracking-wider text-zinc-500">{label}</span>
-      <input type={type} value={value} onChange={onChange} placeholder={placeholder} className="bg-black border border-zinc-700 rounded-lg px-3 py-2 text-[14px] focus:outline-none focus:border-green-500" />
+      <input
+        type={isNumeric ? "text" : type}
+        inputMode={isNumeric ? "decimal" : undefined}
+        value={value}
+        onChange={onChange}
+        placeholder={placeholder}
+        className="bg-black border border-zinc-700 rounded-lg px-3 py-2 text-[14px] focus:outline-none focus:border-green-500"
+      />
     </label>
   );
 }
