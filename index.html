@@ -882,7 +882,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
               { id: "evolucao", label: "Evolução", icon: TrendingUp },
               { id: "checkin", label: "Acompanhamento", icon: CalendarCheck },
             ].map(({ id, label, icon: Icon }) => (
-              <button key={id} onClick={() => setTab(id)} className={`flex-1 min-w-[76px] flex items-center justify-center gap-1.5 py-2 rounded-lg text-[13px] font-medium transition ${tab === id ? "bg-zinc-800 text-white" : "text-zinc-500 hover:text-zinc-400"}`}>
+              <button key={id} onClick={() => setTab(id)} className={`flex-shrink-0 whitespace-nowrap flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-[13px] font-medium transition ${tab === id ? "bg-zinc-800 text-white" : "text-zinc-500 hover:text-zinc-400"}`}>
                 <Icon size={14} />{label}
               </button>
             ))}
@@ -1045,14 +1045,18 @@ const UNIT_OPTIONS = {
 };
 
 function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFood, onRemoveCustomFood, recipes, onAddRecipe, onRemoveRecipe, onClose }) {
-  const [mode, setMode] = useState(editing ? "manual" : "buscar");
+  const editingHasBase = !!(editing && editing.baseFood);
+  const [mode, setMode] = useState(editing ? (editingHasBase ? "buscar" : "manual") : "buscar");
+  const [justAdded, setJustAdded] = useState(null); // nome do último item lançado nesta sessão do modal
 
   // busca
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState(null);
-  const [unit, setUnit] = useState("g");
-  const [qty, setQty] = useState("100");
-  const [gramsPerUnit, setGramsPerUnit] = useState(String(UNIT_OPTIONS["g"].gramsPerUnit));
+  const [selected, setSelected] = useState(editingHasBase
+    ? { name: editing.baseFood.baseName, kcal: editing.baseFood.kcal, protein: editing.baseFood.protein, carbs: editing.baseFood.carbs, fat: editing.baseFood.fat }
+    : null);
+  const [unit, setUnit] = useState(editingHasBase ? editing.unit : "g");
+  const [qty, setQty] = useState(editingHasBase ? String(editing.qty) : "100");
+  const [gramsPerUnit, setGramsPerUnit] = useState(editingHasBase ? String(editing.gramsPerUnit) : String(UNIT_OPTIONS["g"].gramsPerUnit));
   const allFoods = useMemo(() => [
     ...customFoods.map((f) => ({ ...f, custom: true })),
     ...FOOD_DB,
@@ -1072,13 +1076,30 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
   } : null;
   const qtyLabel = unit === "g" ? `${Math.round(totalGrams)}g` : `${qty} ${UNIT_OPTIONS[unit].label.toLowerCase()}${toNum(qty) > 1 ? "s" : ""} (~${Math.round(totalGrams)}g)`;
 
+  const resetSearch = () => {
+    setSelected(null);
+    setQuery("");
+    setUnit("g");
+    setQty("100");
+    setGramsPerUnit(String(UNIT_OPTIONS["g"].gramsPerUnit));
+  };
+
+  const buildBuscarFood = () => ({
+    name: `${selected.name} (${qtyLabel})`,
+    ...scaled,
+    baseFood: { kcal: selected.kcal, protein: selected.protein, carbs: selected.carbs, fat: selected.fat, baseName: selected.name },
+    unit, qty: toNum(qty), gramsPerUnit: toNum(gramsPerUnit),
+  });
+
   // manual
-  const [form, setForm] = useState(editing
+  const [form, setForm] = useState(editing && !editingHasBase
     ? { name: editing.name, kcal: String(editing.kcal), protein: String(editing.protein), carbs: String(editing.carbs), fat: String(editing.fat) }
     : { name: "", kcal: "", protein: "", carbs: "", fat: "" });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const manualValid = form.name.trim() && form.kcal !== "";
   const [saveForReuse, setSaveForReuse] = useState(true);
+
+  const resetManual = () => setForm({ name: "", kcal: "", protein: "", carbs: "", fat: "" });
 
   return (
     <Modal onClose={onClose} title={editing ? "Editar alimento" : "Adicionar alimento"}>
@@ -1090,6 +1111,10 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
         </div>
       )}
 
+      {justAdded && (
+        <p className="mb-3 font-mono text-[11px] text-green-500 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">✓ {justAdded} lançado — pode adicionar mais ou finalizar</p>
+      )}
+
       {mode === "receitas" && (
         <div className="flex flex-col gap-1 max-h-[50vh] overflow-y-auto">
           {(!recipes || recipes.length === 0) && <p className="text-center text-[13px] text-zinc-500 font-mono py-6">nenhuma receita salva ainda — salve uma refeição em "Nutrição" pra ela aparecer aqui</p>}
@@ -1098,7 +1123,7 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
             return (
               <div key={r.id} className="flex items-center gap-1">
                 <button
-                  onClick={() => { onAddRecipe(r); onClose(); }}
+                  onClick={() => { onAddRecipe(r); setJustAdded(r.name); }}
                   className="flex-1 flex items-center justify-between text-left bg-black hover:bg-zinc-800 border border-zinc-800 rounded-lg px-3 py-2 transition"
                 >
                   <span className="text-[13px]">{r.name}</span>
@@ -1135,7 +1160,7 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
             <>
               <div className="flex items-center justify-between bg-zinc-800 rounded-lg px-3 py-2.5 border border-zinc-800">
                 <span className="text-[14px] font-medium">{selected.name}</span>
-                <button onClick={() => setSelected(null)} className="text-zinc-500 hover:text-white"><X size={15} /></button>
+                {!editing && <button onClick={() => setSelected(null)} className="text-zinc-500 hover:text-white"><X size={15} /></button>}
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <label className="flex flex-col gap-1">
@@ -1156,7 +1181,14 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
               <p className="font-mono text-[12px] text-zinc-400 bg-black border border-zinc-800 rounded-lg px-3 py-2">
                 {qtyLabel} · {scaled.kcal} kcal · P {scaled.protein}g · C {scaled.carbs}g · G {scaled.fat}g
               </p>
-              <button onClick={() => { onAdd({ name: `${selected.name} (${qtyLabel})`, ...scaled }); onClose(); }} className="mt-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] transition">Lançar alimento</button>
+              {editing ? (
+                <button onClick={() => { onSaveEdit(buildBuscarFood()); onClose(); }} className="mt-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] transition">Salvar alterações</button>
+              ) : (
+                <div className="flex gap-2 mt-1">
+                  <button onClick={() => { onAdd(buildBuscarFood()); setJustAdded(selected.name); resetSearch(); }} className="flex-1 bg-zinc-800 text-white font-semibold rounded-lg py-2.5 text-[14px] transition">Próximo</button>
+                  <button onClick={() => { onAdd(buildBuscarFood()); onClose(); }} className="flex-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] transition">Finalizar</button>
+                </div>
+              )}
             </>
           )}
         </div>
@@ -1175,22 +1207,43 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
               salvar em "meus alimentos" pra reusar depois
             </label>
           )}
-          <button
-            disabled={!manualValid}
-            onClick={() => {
-              const food = { name: form.name.trim(), kcal: toNum(form.kcal) || 0, protein: toNum(form.protein) || 0, carbs: toNum(form.carbs) || 0, fat: toNum(form.fat) || 0 };
-              if (editing) {
-                onSaveEdit(food);
-              } else {
-                onAdd(food);
-                if (saveForReuse) onSaveCustomFood(food);
-              }
-              onClose();
-            }}
-            className="mt-1 bg-green-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-black font-semibold rounded-lg py-2.5 text-[14px] transition"
-          >
-            {editing ? "Salvar alterações" : "Lançar alimento"}
-          </button>
+          {editing ? (
+            <button
+              disabled={!manualValid}
+              onClick={() => { onSaveEdit({ name: form.name.trim(), kcal: toNum(form.kcal) || 0, protein: toNum(form.protein) || 0, carbs: toNum(form.carbs) || 0, fat: toNum(form.fat) || 0 }); onClose(); }}
+              className="mt-1 bg-green-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-black font-semibold rounded-lg py-2.5 text-[14px] transition"
+            >
+              Salvar alterações
+            </button>
+          ) : (
+            <div className="flex gap-2 mt-1">
+              <button
+                disabled={!manualValid}
+                onClick={() => {
+                  const food = { name: form.name.trim(), kcal: toNum(form.kcal) || 0, protein: toNum(form.protein) || 0, carbs: toNum(form.carbs) || 0, fat: toNum(form.fat) || 0 };
+                  onAdd(food);
+                  if (saveForReuse) onSaveCustomFood(food);
+                  setJustAdded(food.name);
+                  resetManual();
+                }}
+                className="flex-1 bg-zinc-800 disabled:bg-zinc-800 disabled:text-zinc-600 text-white font-semibold rounded-lg py-2.5 text-[14px] transition"
+              >
+                Próximo
+              </button>
+              <button
+                disabled={!manualValid}
+                onClick={() => {
+                  const food = { name: form.name.trim(), kcal: toNum(form.kcal) || 0, protein: toNum(form.protein) || 0, carbs: toNum(form.carbs) || 0, fat: toNum(form.fat) || 0 };
+                  onAdd(food);
+                  if (saveForReuse) onSaveCustomFood(food);
+                  onClose();
+                }}
+                className="flex-1 bg-green-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-black font-semibold rounded-lg py-2.5 text-[14px] transition"
+              >
+                Finalizar
+              </button>
+            </div>
+          )}
         </div>
       ))}
     </Modal>
@@ -1944,16 +1997,27 @@ function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal, macroG
   );
 }
 
+function pctColor(pct) {
+  if (pct <= 50) return "#EF4444";
+  if (pct <= 80) return "#F97316";
+  return "#22C55E";
+}
+
+function round1(n) {
+  return Math.round((Number(n) || 0) * 10) / 10;
+}
+
 function AdherenceRow({ label, avg, goal, unit, pct, color }) {
   const barPct = Math.min(100, pct || 0);
+  const barColor = pctColor(pct || 0);
   return (
     <div>
       <div className="flex items-center justify-between mb-1">
         <span className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">{label}</span>
-        <span className="font-mono text-[12px] text-zinc-300">{avg}<span className="text-zinc-600">/{goal || 0}{unit}</span> · <span style={{ color }}>{pct || 0}%</span></span>
+        <span className="font-mono text-[12px] text-zinc-300">{round1(avg)}<span className="text-zinc-600">/{round1(goal)}{unit}</span> · <span style={{ color: barColor }}>{pct || 0}%</span></span>
       </div>
       <div className="h-[6px] rounded-full bg-zinc-800 overflow-hidden">
-        <div className="h-full rounded-full transition-all duration-500" style={{ width: `${barPct}%`, background: color }} />
+        <div className="h-full rounded-full transition-all duration-500" style={{ width: `${barPct}%`, background: barColor }} />
       </div>
     </div>
   );
@@ -1961,6 +2025,7 @@ function AdherenceRow({ label, avg, goal, unit, pct, color }) {
 
 function TrendCard({ title, current, goal, unit, weekDots, successDays, maxStreak }) {
   const pct = goal > 0 ? Math.min(999, Math.round((current / goal) * 100)) : 0;
+  const barColor = pctColor(pct);
   return (
     <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
       <p className="text-[15px] font-medium">{title}</p>
@@ -1970,12 +2035,12 @@ function TrendCard({ title, current, goal, unit, weekDots, successDays, maxStrea
           <p className="font-mono text-[10px] text-zinc-500 mt-0.5">Média diária</p>
         </div>
         <div className="text-right">
-          <p className="font-mono text-xl font-semibold text-green-500">{pct}%</p>
+          <p className="font-mono text-xl font-semibold" style={{ color: barColor }}>{pct}%</p>
           <p className="font-mono text-[10px] text-zinc-500">Comprometimento</p>
         </div>
       </div>
       <div className="mt-3 h-[6px] rounded-full bg-zinc-800 overflow-hidden">
-        <div className="h-full bg-green-500 rounded-full transition-all duration-500" style={{ width: `${Math.min(100, pct)}%` }} />
+        <div className="h-full rounded-full transition-all duration-500" style={{ width: `${Math.min(100, pct)}%`, background: barColor }} />
       </div>
       <div className="mt-4 flex items-center justify-between">
         <div>
