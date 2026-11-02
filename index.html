@@ -2129,7 +2129,13 @@ function MedidasTab({ evolutionLog, profile, onSaveEntry, onDeleteField, onSaveG
     return (
       <div className="pt-5">
         <button onClick={() => setView("home")} className="flex items-center gap-1 text-[13px] text-zinc-400 mb-3"><ChevronLeft size={15} /> Medidas</button>
-        <h2 className="font-display text-3xl font-bold tracking-tight mb-4">{m.label}</h2>
+        <div className="flex items-center justify-between mb-4 gap-3">
+          <h2 className="font-display text-3xl font-bold tracking-tight">{m.label}</h2>
+          <button onClick={() => setShowForm(true)} className="flex-shrink-0 bg-green-500 text-black font-semibold rounded-full pl-3 pr-4 py-2 text-[14px] flex items-center gap-1 active:brightness-90"><Plus size={16} /> Adicionar</button>
+        </div>
+        {showForm && (m.key === "bodyFat"
+          ? <MeasureEntryModal evolutionLog={evolutionLog} heightCm={profile.heightCm} onSave={(d, e) => { onSaveEntry(d, e); setShowForm(false); }} onClose={() => setShowForm(false)} />
+          : <QuickMeasureModal measure={m} evolutionLog={evolutionLog} heightCm={profile.heightCm} onSave={(d, e) => { onSaveEntry(d, e); setShowForm(false); }} onClose={() => setShowForm(false)} />)}
         {!st ? (
           <p className="text-center text-[13px] text-zinc-500 font-mono py-10">nenhum registro ainda</p>
         ) : (
@@ -2256,6 +2262,42 @@ function useMeasureForm(entry, heightCm) {
     </div>
   );
   return { fields, values, reset };
+}
+
+// lançamento rápido de uma medida só (peso ou cintura), em qualquer dia
+function QuickMeasureModal({ measure, evolutionLog, heightCm, onSave, onClose }) {
+  const [d, setD] = useState(todayStr());
+  const cur = (day) => (evolutionLog[day] && evolutionLog[day][measure.key] != null ? String(evolutionLog[day][measure.key]).replace(".", ",") : "");
+  const [val, setVal] = useState(cur(todayStr()));
+  useEffect(() => { setVal(cur(d)); }, [d]);
+  const save = () => {
+    const v = toNum(val);
+    if (!v) return;
+    const entry = { [measure.key]: v };
+    // se mudou a cintura e o dia tem pescoço, recalcula o % de gordura
+    if (measure.key === "waist") {
+      const neck = evolutionLog[d]?.neck;
+      const bf = navyBodyFat({ neck, waist: v, heightCm });
+      if (bf) entry.bodyFat = bf;
+    }
+    onSave(d, entry);
+  };
+  return (
+    <Modal title={`Adicionar ${measure.label.toLowerCase()}`} onClose={onClose}>
+      <div className="flex flex-col gap-3">
+        <label className="flex flex-col gap-1">
+          <span className="text-[11px] font-mono uppercase tracking-wider text-zinc-500">Data</span>
+          <input type="date" value={d} max={todayStr()} onChange={(e) => e.target.value && setD(e.target.value)} className="bg-black border border-zinc-700 rounded-lg px-3 py-2 text-[14px] focus:outline-none focus:border-green-500 text-white" style={{ colorScheme: "dark" }} />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-[11px] font-mono uppercase tracking-wider text-zinc-500">{measure.label} ({measure.unit})</span>
+          <input autoFocus type="text" inputMode="decimal" value={val} onChange={(e) => setVal(e.target.value)} onKeyDown={(e) => e.key === "Enter" && save()} placeholder="0,0" className="bg-black border border-zinc-700 rounded-xl px-4 py-4 font-mono text-3xl text-center focus:outline-none focus:border-green-500" />
+        </label>
+        {cur(d) && <p className="font-mono text-[11px] text-zinc-500 text-center">já existe um valor nesse dia — salvar substitui</p>}
+        <button onClick={save} disabled={!toNum(val)} className="mt-1 bg-green-500 disabled:bg-zinc-800 disabled:text-zinc-500 text-black font-semibold rounded-xl py-3 text-[15px]">Salvar</button>
+      </div>
+    </Modal>
+  );
 }
 
 function MeasureEntryModal({ evolutionLog, heightCm, onSave, onClose }) {
