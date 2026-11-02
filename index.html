@@ -397,7 +397,8 @@ function compressImage(file, maxW = 320, quality = 0.6) {
   });
 }
 
-const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
+let CURRENT_USER_ID = null; // preenchido pelo login; cada linha do banco fica marcada com o dono
 
 async function storeGet(key, fallback) {
   try {
@@ -408,9 +409,23 @@ async function storeGet(key, fallback) {
     return fallback;
   }
 }
+async function storeListPrefix(prefix) {
+  try {
+    const { data, error } = await supabaseClient.from("diario_kv").select("key, value").like("key", `${prefix}%`);
+    return error || !data ? [] : data;
+  } catch (e) {
+    return [];
+  }
+}
 async function storeSet(key, value) {
   try {
-    const { error } = await supabaseClient.from("diario_kv").upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: "key" });
+    const row = { key, value, updated_at: new Date().toISOString(), user_id: CURRENT_USER_ID };
+    let { error } = await supabaseClient.from("diario_kv").upsert(row, { onConflict: "key" });
+    // se o SQL de login ainda não foi rodado, a coluna user_id não existe: grava sem ela
+    if (error && /user_id/.test(error.message || "")) {
+      delete row.user_id;
+      ({ error } = await supabaseClient.from("diario_kv").upsert(row, { onConflict: "key" }));
+    }
     if (error) {
       console.error("storeSet failed", key, error);
       return { ok: false, error };
@@ -610,119 +625,208 @@ function getDayMeals(foodLog, date) {
 
 const SECTION_TITLES = { nutricao: "Dieta", treino: "Treino", medidas: "Medidas", metricas: "Métricas", checkin: "Check-in" };
 
-// ---------- seleção de perfil (uso familiar) ----------
-const ACTIVE_PROFILE_LS_KEY = "diario-active-profile-id";
+// ---------- login (Supabase Auth) — cada pessoa tem sua conta ----------
+const LEGACY_KEYS = ["profile-goals", "food-log", "custom-foods", "training-plans", "training-log", "custom-exercises", "evolution-log", "water-log", "recipes", "activity-log", "checkins"];
 
-function AppRoot() {
-  const [loading, setLoading] = useState(true);
-  const [profiles, setProfiles] = useState([]);
-  const [activeProfileId, setActiveProfileId] = useState(null);
-  const [creating, setCreating] = useState(false);
-  const [newName, setNewName] = useState("");
+const AUTH_ERRORS = {
+  "Invalid login credentials": "e-mail ou senha incorretos",
+  "Email not confirmed": "confirme seu e-mail pelo link que enviamos antes de entrar",
+  "User already registered": "já existe uma conta com esse e-mail — use \"Entrar\"",
+  "Password should be at least 6 characters": "a senha precisa ter pelo menos 6 caracteres",
+  "Signups not allowed for this instance": "cadastro de novas contas está fechado — peça para o administrador criar sua conta",
+  "Failed to fetch": "sem conexão com o servidor (o projeto Supabase pode estar pausado)",
+};
+const authMsg = (err) => {
+  const m = (err && (err.message || String(err))) || "erro desconhecido";
+  const hit = Object.keys(AUTH_ERRORS).find((k) => m.includes(k));
+  return hit ? AUTH_ERRORS[hit] : m;
+};
 
-  useEffect(() => {
-    (async () => {
-      let list = await storeGet("profiles", null);
-
-      if (list === null) {
-        // primeira vez rodando neste banco: migra dados antigos (sem
-        // prefixo de perfil) para um perfil "Principal", se existirem.
-        const legacyGoals = await storeGet("profile-goals", null);
-        const firstProfile = { id: uid(), name: "Principal" };
-        list = [firstProfile];
-        await storeSet("profiles", list);
-
-        if (legacyGoals !== null) {
-          const legacyKeys = ["profile-goals", "food-log", "custom-foods", "training-plans", "training-log", "custom-exercises", "evolution-log"];
-          for (const k of legacyKeys) {
-            const val = await storeGet(k, null);
-            if (val !== null) await storeSet(`${firstProfile.id}:${k}`, val);
-          }
-        }
-      }
-
-      setProfiles(list);
-      const saved = localStorage.getItem(ACTIVE_PROFILE_LS_KEY);
-      if (saved && list.some((p) => p.id === saved)) {
-        setActiveProfileId(saved);
-      } else if (list.length === 1) {
-        setActiveProfileId(list[0].id);
-        localStorage.setItem(ACTIVE_PROFILE_LS_KEY, list[0].id);
-      }
-      setLoading(false);
-    })();
-  }, []);
-
-  const chooseProfile = (id) => {
-    localStorage.setItem(ACTIVE_PROFILE_LS_KEY, id);
-    setActiveProfileId(id);
-  };
-
-  const [createError, setCreateError] = useState(null);
-
-  const createProfile = async () => {
-    if (!newName.trim()) return;
-    const p = { id: uid(), name: newName.trim() };
-    const next = [...profiles, p];
-    setCreateError(null);
-    const res = await storeSet("profiles", next);
-    if (!res.ok) {
-      setCreateError(res.error?.message || "erro desconhecido ao salvar");
-      return;
-    }
-    setProfiles(next);
-    setNewName("");
-    setCreating(false);
-    chooseProfile(p.id);
-  };
-
-  const switchProfile = () => {
-    localStorage.removeItem(ACTIVE_PROFILE_LS_KEY);
-    setActiveProfileId(null);
-  };
-
-  if (loading) {
-    return <div className="min-h-screen bg-black flex items-center justify-center"><span className="font-mono text-zinc-400 text-sm tracking-widest">carregando…</span></div>;
-  }
-
-  if (activeProfileId) {
-    return <DiarioFit key={activeProfileId} profileId={activeProfileId} onSwitchProfile={switchProfile} profileName={profiles.find((p) => p.id === activeProfileId)?.name || ""} />;
-  }
-
+function AuthShell({ title, subtitle, children }) {
   return (
-    <div className="min-h-screen bg-black text-white flex flex-col items-center justify-center px-6" style={{ fontFamily: "'Inter', system-ui, sans-serif" }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
-        .font-display { font-family: 'Barlow Condensed', sans-serif; }
-        .font-mono { font-family: 'JetBrains Mono', monospace; }
-      `}</style>
-      <p className="font-mono text-[10px] tracking-[0.25em] text-zinc-500 uppercase mb-1">Diário</p>
-      <h1 className="font-display text-3xl font-bold mb-8">Quem é você?</h1>
-
-      <div className="w-full max-w-xs flex flex-col gap-2">
-        {profiles.map((p) => (
-          <button key={p.id} onClick={() => chooseProfile(p.id)} className="bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-left text-[15px] font-medium hover:border-green-500 transition">
-            {p.name}
-          </button>
-        ))}
-
-        {!creating ? (
-          <button onClick={() => setCreating(true)} className="mt-2 flex items-center justify-center gap-1.5 border border-dashed border-zinc-700 rounded-xl px-4 py-3 text-[14px] text-zinc-400 hover:text-white hover:border-zinc-500 transition">
-            <Plus size={15} /> Novo perfil
-          </button>
-        ) : (
-          <div className="mt-2 flex flex-col gap-2">
-            <input autoFocus value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Nome" className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2.5 text-[14px] focus:outline-none focus:border-green-500" />
-            {createError && <p className="font-mono text-[11px] text-white bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">erro ao salvar: {createError}</p>}
-            <button onClick={createProfile} disabled={!newName.trim()} className="bg-green-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-black font-semibold rounded-lg py-2.5 text-[14px]">Criar perfil</button>
-          </div>
-        )}
+    <div className="min-h-screen bg-black text-white flex flex-col items-center justify-center px-6 py-10" style={{ fontFamily: "'Inter', system-ui, sans-serif" }}>
+      <div className="w-full max-w-sm">
+        <p className="font-mono text-[10px] tracking-[0.25em] text-zinc-500 uppercase text-center">Diário Fit</p>
+        <h1 className="font-display text-4xl font-bold text-center mt-1">{title}</h1>
+        {subtitle && <p className="text-[13px] text-zinc-500 text-center mt-1">{subtitle}</p>}
+        <div className="mt-8 flex flex-col gap-3">{children}</div>
       </div>
     </div>
   );
 }
 
-function DiarioFit({ profileId, onSwitchProfile, profileName }) {
+function AuthInput(props) {
+  return <input {...props} className="bg-zinc-900 border border-zinc-800 rounded-2xl px-4 py-3.5 text-[16px] focus:outline-none focus:border-green-500 placeholder:text-zinc-600" />;
+}
+
+function LoginScreen() {
+  const [mode, setMode] = useState("login"); // login | signup | forgot
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null); // { type: "error"|"ok", text }
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true); setMsg(null);
+    try {
+      if (mode === "login") {
+        const { error } = await supabaseClient.auth.signInWithPassword({ email: email.trim(), password });
+        if (error) throw error;
+      } else if (mode === "signup") {
+        if (!name.trim()) throw new Error("informe seu nome");
+        const { data, error } = await supabaseClient.auth.signUp({ email: email.trim(), password, options: { data: { name: name.trim() }, emailRedirectTo: location.origin + location.pathname } });
+        if (error) throw error;
+        if (!data.session) {
+          setMsg({ type: "ok", text: "conta criada! abra o link de confirmação que enviamos para o seu e-mail e depois entre aqui" });
+          setMode("login");
+        }
+      } else {
+        const { error } = await supabaseClient.auth.resetPasswordForEmail(email.trim(), { redirectTo: location.origin + location.pathname });
+        if (error) throw error;
+        setMsg({ type: "ok", text: "se existir uma conta com esse e-mail, enviamos um link para criar uma nova senha" });
+      }
+    } catch (err) {
+      setMsg({ type: "error", text: authMsg(err) });
+    }
+    setBusy(false);
+  };
+
+  const titles = { login: "Entrar", signup: "Criar conta", forgot: "Esqueci a senha" };
+  return (
+    <AuthShell title={titles[mode]} subtitle={mode === "forgot" ? "enviamos um link para você criar uma nova senha" : null}>
+      <form onSubmit={submit} className="flex flex-col gap-3">
+        {mode === "signup" && <AuthInput placeholder="Seu nome" value={name} onChange={(e) => setName(e.target.value)} autoComplete="given-name" />}
+        <AuthInput type="email" placeholder="E-mail" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" autoCapitalize="none" required />
+        {mode !== "forgot" && (
+          <AuthInput type="password" placeholder={mode === "signup" ? "Crie uma senha (mín. 6 caracteres)" : "Senha"} value={password} onChange={(e) => setPassword(e.target.value)} autoComplete={mode === "signup" ? "new-password" : "current-password"} minLength={6} required />
+        )}
+        {msg && <p className={`font-mono text-[12px] rounded-xl px-3 py-2.5 border ${msg.type === "error" ? "text-red-300 border-red-900 bg-red-950/40" : "text-green-400 border-zinc-800 bg-zinc-900"}`}>{msg.text}</p>}
+        <button type="submit" disabled={busy} className="mt-1 bg-green-500 disabled:opacity-60 text-black font-semibold rounded-2xl py-4 text-[16px] active:brightness-90">
+          {busy ? "aguarde…" : mode === "login" ? "Entrar" : mode === "signup" ? "Criar conta" : "Enviar link"}
+        </button>
+      </form>
+      <div className="mt-2 flex flex-col items-center gap-3 text-[14px]">
+        {mode === "login" && <button onClick={() => { setMode("forgot"); setMsg(null); }} className="text-zinc-400">Esqueci a senha</button>}
+        {mode === "login" ? (
+          <button onClick={() => { setMode("signup"); setMsg(null); }} className="text-zinc-400">Não tem conta? <span className="text-green-500 font-medium">Criar conta</span></button>
+        ) : (
+          <button onClick={() => { setMode("login"); setMsg(null); }} className="text-zinc-400">Já tem conta? <span className="text-green-500 font-medium">Entrar</span></button>
+        )}
+      </div>
+    </AuthShell>
+  );
+}
+
+function NewPasswordScreen({ onDone }) {
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true); setMsg(null);
+    const { error } = await supabaseClient.auth.updateUser({ password });
+    setBusy(false);
+    if (error) setMsg(authMsg(error)); else onDone();
+  };
+  return (
+    <AuthShell title="Nova senha">
+      <form onSubmit={submit} className="flex flex-col gap-3">
+        <AuthInput type="password" placeholder="Nova senha (mín. 6 caracteres)" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" minLength={6} required />
+        {msg && <p className="font-mono text-[12px] rounded-xl px-3 py-2.5 border text-red-300 border-red-900">{msg}</p>}
+        <button type="submit" disabled={busy} className="bg-green-500 disabled:opacity-60 text-black font-semibold rounded-2xl py-4 text-[16px]">{busy ? "salvando…" : "Salvar nova senha"}</button>
+      </form>
+    </AuthShell>
+  );
+}
+
+// dados do tempo dos perfis sem login — oferece copiar um perfil para a conta
+function LegacyImportScreen({ userId, legacyProfiles, onDone }) {
+  const [busy, setBusy] = useState(null);
+  const [error, setError] = useState(null);
+  const importFrom = async (pid) => {
+    setBusy(pid); setError(null);
+    try {
+      for (const k of LEGACY_KEYS) {
+        const val = await storeGet(`${pid}:${k}`, null);
+        if (val !== null) {
+          const r = await storeSet(`${userId}:${k}`, val);
+          if (!r.ok) throw r.error;
+        }
+      }
+      const photos = await storeListPrefix(`${pid}:checkin-photos:`);
+      for (const row of photos) {
+        const r = await storeSet(`${userId}:${row.key.slice(pid.length + 1)}`, row.value);
+        if (!r.ok) throw r.error;
+      }
+      await storeSet(`${userId}:legacy-imported`, { from: pid, at: new Date().toISOString() });
+      onDone();
+    } catch (err) {
+      setError(authMsg(err));
+      setBusy(null);
+    }
+  };
+  const skip = async () => { await storeSet(`${userId}:legacy-imported`, { from: null, at: new Date().toISOString() }); onDone(); };
+  return (
+    <AuthShell title="Dados antigos" subtitle="Encontramos perfis da versão sem login. Qual deles é o seu?">
+      {legacyProfiles.map((p) => (
+        <button key={p.id} onClick={() => importFrom(p.id)} disabled={!!busy} className="bg-zinc-900 border border-zinc-800 rounded-2xl px-5 py-4 text-left text-[16px] font-medium active:border-green-500 disabled:opacity-60 flex items-center justify-between">
+          <span>{p.name}</span>
+          <span className="font-mono text-[11px] text-green-500">{busy === p.id ? "importando…" : "importar"}</span>
+        </button>
+      ))}
+      {error && <p className="font-mono text-[12px] rounded-xl px-3 py-2.5 border text-red-300 border-red-900">{error}</p>}
+      <button onClick={skip} disabled={!!busy} className="mt-2 text-[14px] text-zinc-400 py-2">Nenhum — começar do zero</button>
+    </AuthShell>
+  );
+}
+
+function AppRoot() {
+  const [session, setSession] = useState(undefined); // undefined = carregando
+  const [recovering, setRecovering] = useState(false);
+  const [legacy, setLegacy] = useState(null); // null = verificando | [] = nada a importar | [...]
+
+  useEffect(() => {
+    supabaseClient.auth.getSession().then(({ data }) => setSession(data.session || null)).catch(() => setSession(null));
+    const { data: sub } = supabaseClient.auth.onAuthStateChange((event, s) => {
+      if (event === "PASSWORD_RECOVERY") setRecovering(true);
+      setSession(s || null);
+    });
+    return () => sub?.subscription?.unsubscribe();
+  }, []);
+
+  const userId = session?.user?.id || null;
+  CURRENT_USER_ID = userId;
+
+  useEffect(() => {
+    if (!userId) return;
+    setLegacy(null);
+    (async () => {
+      const [done, mine, profiles] = await Promise.all([
+        storeGet(`${userId}:legacy-imported`, null),
+        storeGet(`${userId}:profile-goals`, null),
+        storeGet("profiles", null),
+      ]);
+      if (done || mine || !Array.isArray(profiles) || profiles.length === 0) setLegacy([]);
+      else setLegacy(profiles);
+    })();
+  }, [userId]);
+
+  const signOut = async () => { await supabaseClient.auth.signOut(); setLegacy(null); };
+
+  const loadingScreen = <div className="min-h-screen bg-black flex items-center justify-center"><span className="font-mono text-zinc-400 text-sm tracking-widest">carregando…</span></div>;
+  if (session === undefined) return loadingScreen;
+  if (recovering && session) return <NewPasswordScreen onDone={() => setRecovering(false)} />;
+  if (!session) return <LoginScreen />;
+  if (legacy === null) return loadingScreen;
+  if (legacy.length > 0) return <LegacyImportScreen userId={userId} legacyProfiles={legacy} onDone={() => setLegacy([])} />;
+
+  const meta = session.user.user_metadata || {};
+  return <DiarioFit key={userId} profileId={userId} onSignOut={signOut} profileName={meta.name || ""} email={session.user.email} />;
+}
+
+function DiarioFit({ profileId, onSignOut, profileName, email }) {
   const pk = (k) => `${profileId}:${k}`;
   const [tab, setTab] = useState("home");
   const [date, setDate] = useState(todayStr());
@@ -747,7 +851,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
   useEffect(() => {
     (async () => {
       const [p, f, cf, pl, tl, ce, el, wl, rc, al, ck] = await Promise.all([
-        storeGet(pk("profile-goals"), DEFAULT_PROFILE),
+        storeGet(pk("profile-goals"), null),
         storeGet(pk("food-log"), {}),
         storeGet(pk("custom-foods"), []),
         storeGet(pk("training-plans"), []),
@@ -759,7 +863,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
         storeGet(pk("activity-log"), {}),
         storeGet(pk("checkins"), {}),
       ]);
-      setProfile({ ...DEFAULT_PROFILE, ...p });
+      setProfile({ ...DEFAULT_PROFILE, name: profileName, ...(p || {}) });
       setFoodLog(f);
       setCustomFoods(cf);
       setPlans(pl);
@@ -1080,7 +1184,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
         )}
       </main>
 
-      {showProfile && <ProfileModal profile={profile} onSave={saveProfile} onClose={() => setShowProfile(false)} onSwitchProfile={onSwitchProfile} profileName={profileName} />}
+      {showProfile && <ProfileModal profile={profile} onSave={saveProfile} onClose={() => setShowProfile(false)} onSignOut={onSignOut} email={email} />}
       {addFoodCtx && (
         <AddFoodModal
           editing={addFoodCtx.editing}
@@ -2666,7 +2770,7 @@ function CheckinTab({ checkins, evolutionLog, heightCm, loadPhotos, onSave, onDe
 }
 
 // ---------- Profile modal ----------
-function ProfileModal({ profile, onSave, onClose, onSwitchProfile, profileName }) {
+function ProfileModal({ profile, onSave, onClose, onSignOut, email }) {
   const [form, setForm] = useState(profile);
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const refWeight = toNum(form.refWeight) || 0;
@@ -2681,10 +2785,10 @@ function ProfileModal({ profile, onSave, onClose, onSwitchProfile, profileName }
   return (
     <Modal onClose={onClose} title="Perfil e metas">
       <div className="flex flex-col gap-3">
-        {profileName && (
-          <div className="flex items-center justify-between bg-black border border-zinc-800 rounded-lg px-3 py-2">
-            <span className="font-mono text-[12px] text-zinc-400">perfil: <span className="text-white">{profileName}</span></span>
-            {onSwitchProfile && <button onClick={onSwitchProfile} className="font-mono text-[11px] text-green-500">trocar perfil</button>}
+        {email && (
+          <div className="flex items-center justify-between gap-2 bg-black border border-zinc-800 rounded-lg px-3 py-2">
+            <span className="font-mono text-[12px] text-zinc-400 truncate">conta: <span className="text-white">{email}</span></span>
+            {onSignOut && <button onClick={() => { if (confirm("Sair da conta?")) onSignOut(); }} className="font-mono text-[11px] text-red-400 flex-shrink-0">sair</button>}
           </div>
         )}
 
