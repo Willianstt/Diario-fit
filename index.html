@@ -1244,6 +1244,295 @@ const UNIT_OPTIONS = {
   copo: { label: "Copo", gramsPerUnit: 200 },
 };
 
+// ---------- cadastro de alimento por foto (OCR no próprio aparelho) ----------
+// As fotos ficam só na memória do navegador enquanto a tela está aberta:
+// não são enviadas a servidor nenhum nem salvas no banco, e são descartadas ao salvar/cancelar.
+const TESSERACT_SRC = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+let tesseractLoading = null;
+function loadTesseract() {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (!tesseractLoading) {
+    tesseractLoading = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = TESSERACT_SRC;
+      s.onload = () => resolve(window.Tesseract);
+      s.onerror = () => { tesseractLoading = null; reject(new Error("não consegui baixar o leitor de texto — verifique a internet")); };
+      document.head.appendChild(s);
+    });
+  }
+  return tesseractLoading;
+}
+
+// reduz, passa pra cinza e aumenta o contraste — melhora bastante a leitura de foto de celular
+function prepareForOcr(file, maxSide = 1800) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      const px = ctx.getImageData(0, 0, c.width, c.height);
+      const d = px.data;
+      let min = 255, max = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        const g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        d[i] = g; if (g < min) min = g; if (g > max) max = g;
+      }
+      const range = Math.max(1, max - min);
+      for (let i = 0; i < d.length; i += 4) {
+        const v = ((d[i] - min) / range) * 255;
+        d[i] = d[i + 1] = d[i + 2] = v;
+      }
+      ctx.putImageData(px, 0, 0);
+      URL.revokeObjectURL(url);
+      resolve(c);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("não consegui abrir a foto")); };
+    img.src = url;
+  });
+}
+
+// lê a tabela nutricional brasileira (formato novo RDC 429 "100 g | porção | %VD" e o antigo "por porção")
+function parseNutritionText(raw) {
+  const text = raw.replace(/\r/g, "");
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const norm = (s) => s.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+  const nlines = lines.map(norm);
+  const numsAfterLabel = (line) => {
+    const cleaned = line
+      .replace(/\((?:k?cal|kj|g|mg|mcg|µg|ml)\)/gi, " ")
+      .replace(/\b(\d+)\s*%/g, " ")          // tira %VD
+      .replace(/[oO](?=[,.]?\d)/g, "0");       // OCR troca 0 por O
+    const out = [];
+    const re = /(\d+(?:[.,]\d+)?)/g;
+    let m;
+    while ((m = re.exec(cleaned)) !== null) out.push(parseFloat(m[1].replace(",", ".")));
+    return out;
+  };
+  const find = (rx, not) => {
+    for (let i = 0; i < nlines.length; i++) {
+      if (rx.test(nlines[i]) && !(not && not.test(nlines[i]))) {
+        let nums = numsAfterLabel(nlines[i].replace(rx, " "));
+        // às vezes o número cai na linha de baixo
+        if (!nums.length && i + 1 < nlines.length) nums = numsAfterLabel(nlines[i + 1]);
+        if (nums.length) return { nums, line: lines[i] };
+      }
+    }
+    return null;
+  };
+
+  const energy = (() => {
+    for (let i = 0; i < nlines.length; i++) {
+      const l = nlines[i];
+      if (!/valor\s*energ|energia/.test(l)) continue;
+      // formato antigo: "114 kcal = 479 kJ"
+      const k = l.match(/(\d+(?:[.,]\d+)?)\s*kcal/);
+      if (k) return { nums: [parseFloat(k[1].replace(",", "."))], line: lines[i], inline: true };
+      const nums = numsAfterLabel(l.replace(/valor\s*energetico|energia/, " ").replace(/kj.*$/, ""));
+      if (nums.length) return { nums, line: lines[i] };
+    }
+    return null;
+  })();
+  const carbs = find(/carboidrato/, /acucar|adicionad/);
+  const protein = find(/prote[ií]na/);
+  const fat = find(/gorduras?\s*tota|lipid|gorduras?\b/, /saturad|trans|mono|poli/);
+  const fiber = find(/fibra/);
+
+  // base da tabela
+  const header = nlines.slice(0, 12).join(" ") + " " + nlines.join(" ");
+  const has100 = /\b100\s*(g|ml)\b/.test(header);
+  const portionMatch = header.match(/por[cç]?[aã]o[^0-9]{0,25}(\d+(?:[.,]\d+)?)\s*(g|ml)/) || header.match(/(\d+(?:[.,]\d+)?)\s*(g|ml)\s*\(/);
+  const portion = portionMatch ? parseFloat(portionMatch[1].replace(",", ".")) : null;
+  const per100 = has100 && !(energy && energy.inline);
+  const pick = (r) => (r && r.nums.length ? r.nums[0] : null);
+  const base = per100 ? 100 : portion || 100;
+  const factor = 100 / base;
+  const val = (r) => { const v = pick(r); return v == null ? null : Math.round(v * factor * 10) / 10; };
+
+  return {
+    basis: per100 ? "100g" : portion ? "porcao" : "desconhecida",
+    portion,
+    kcal: energy ? Math.round(pick(energy) * factor) : null,
+    carbs: val(carbs), protein: val(protein), fat: val(fat), fiber: val(fiber),
+    found: { energy: !!energy, carbs: !!carbs, protein: !!protein, fat: !!fat },
+  };
+}
+
+// sugestões de nome: linhas de texto maiores da foto da frente
+function nameCandidates(data) {
+  const lines = (data && data.lines) || [];
+  return lines
+    .map((l) => ({ text: (l.text || "").replace(/\s+/g, " ").trim(), h: l.bbox ? l.bbox.y1 - l.bbox.y0 : 0, conf: l.confidence || 0 }))
+    .filter((l) => l.text.length >= 3 && /[a-zA-ZÀ-ú]{3,}/.test(l.text) && (l.text.match(/[a-zA-ZÀ-ú ]/g) || []).length / l.text.length > 0.7 && l.conf > 40)
+    .sort((a, b) => b.h - a.h)
+    .slice(0, 5)
+    .map((l) => l.text.replace(/[^\wÀ-ú %,.\-]/g, "").trim())
+    .filter((t, i, arr) => t && arr.indexOf(t) === i);
+}
+
+function PhotoPick({ label, hint, file, onFile }) {
+  const camRef = useRef(null), galRef = useRef(null);
+  const [preview, setPreview] = useState(null);
+  useEffect(() => {
+    if (!file) { setPreview(null); return; }
+    const u = URL.createObjectURL(file);
+    setPreview(u);
+    return () => URL.revokeObjectURL(u);
+  }, [file]);
+  const take = (e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) onFile(f); };
+  return (
+    <div className="bg-black border border-zinc-800 rounded-xl p-3 flex gap-3 items-center">
+      <div className="w-16 h-20 flex-shrink-0 rounded-lg overflow-hidden bg-zinc-900 border border-dashed border-zinc-700 flex items-center justify-center">
+        {preview ? <img src={preview} alt={label} className="w-full h-full object-cover" /> : <Camera size={20} className="text-zinc-600" />}
+      </div>
+      <div className="flex-1 min-w-0">
+        <p className="text-[14px] font-medium">{label}</p>
+        <p className="text-[11px] text-zinc-500 leading-snug">{hint}</p>
+        <div className="mt-2 flex gap-1.5">
+          <input ref={camRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={take} />
+          <input ref={galRef} type="file" accept="image/*" className="hidden" onChange={take} />
+          <button onClick={() => camRef.current?.click()} className="flex-1 bg-zinc-800 rounded-lg py-1.5 text-[12px] active:bg-zinc-700">Tirar foto</button>
+          <button onClick={() => galRef.current?.click()} className="flex-1 bg-zinc-800 rounded-lg py-1.5 text-[12px] active:bg-zinc-700">Galeria</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PhotoFoodForm({ onSaved }) {
+  const [front, setFront] = useState(null);
+  const [label, setLabel] = useState(null);
+  const [stage, setStage] = useState("photos"); // photos | reading | review
+  const [progress, setProgress] = useState("");
+  const [error, setError] = useState(null);
+  const [names, setNames] = useState([]);
+  const [info, setInfo] = useState(null);
+  const [form, setForm] = useState({ name: "", kcal: "", protein: "", carbs: "", fat: "", fiber: "" });
+
+  const discardPhotos = () => { setFront(null); setLabel(null); };
+
+  const read = async () => {
+    setStage("reading"); setError(null);
+    let worker = null;
+    try {
+      setProgress("baixando leitor de texto (só na 1ª vez)…");
+      const T = await loadTesseract();
+      worker = await T.createWorker("por", 1, {
+        logger: (m) => { if (m.status === "recognizing text") setProgress(`lendo… ${Math.round((m.progress || 0) * 100)}%`); },
+      });
+      let parsed = null, cands = [];
+      if (label) {
+        setProgress("lendo a tabela nutricional…");
+        const { data } = await worker.recognize(await prepareForOcr(label));
+        parsed = parseNutritionText(data.text || "");
+      }
+      if (front) {
+        setProgress("lendo a frente da embalagem…");
+        const { data } = await worker.recognize(await prepareForOcr(front, 1400), {}, { blocks: true });
+        cands = nameCandidates(data);
+      }
+      const s = (v) => (v == null || isNaN(v) ? "" : String(v).replace(".", ","));
+      setNames(cands);
+      setInfo(parsed);
+      setForm({
+        name: cands[0] || "",
+        kcal: s(parsed?.kcal), protein: s(parsed?.protein), carbs: s(parsed?.carbs), fat: s(parsed?.fat), fiber: s(parsed?.fiber),
+      });
+      setStage("review");
+      discardPhotos(); // fotos descartadas assim que a leitura termina
+    } catch (e) {
+      console.error(e);
+      setError(e.message || String(e));
+      setStage("photos");
+    } finally {
+      if (worker) worker.terminate();
+    }
+  };
+
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+  const macroKcal = Math.round(toNum(form.protein) * 4 + toNum(form.carbs) * 4 + toNum(form.fat) * 9);
+  const kcalOff = toNum(form.kcal) && macroKcal && Math.abs(toNum(form.kcal) - macroKcal) > Math.max(25, toNum(form.kcal) * 0.15);
+  const valid = form.name.trim() && (toNum(form.kcal) || macroKcal);
+
+  const save = () => {
+    const food = {
+      name: form.name.trim(),
+      kcal: toNum(form.kcal) || macroKcal,
+      protein: toNum(form.protein) || 0, carbs: toNum(form.carbs) || 0, fat: toNum(form.fat) || 0,
+      fiber: toNum(form.fiber) || null,
+      fromPhoto: true,
+    };
+    onSaved(food);
+  };
+
+  if (stage === "reading") {
+    return (
+      <div className="py-10 flex flex-col items-center gap-3">
+        <div className="w-10 h-10 rounded-full border-2 border-zinc-700 border-t-green-500 animate-spin" />
+        <p className="font-mono text-[12px] text-zinc-400">{progress}</p>
+      </div>
+    );
+  }
+
+  if (stage === "review") {
+    const missing = info && Object.entries(info.found).filter(([, v]) => !v).map(([k]) => ({ energy: "calorias", carbs: "carboidrato", protein: "proteína", fat: "gordura" }[k]));
+    return (
+      <div className="flex flex-col gap-3">
+        <p className="font-mono text-[11px] text-green-500 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">✓ fotos lidas e apagadas — confira os dados antes de salvar</p>
+        <Field label="Nome" value={form.name} onChange={set("name")} placeholder="nome do produto" />
+        {names.length > 1 && <p className="font-mono text-[10px] text-zinc-600 -mt-1">toque para juntar trechos ao nome</p>}
+        {names.length > 1 && (
+          <div className="flex flex-wrap gap-1.5 -mt-1">
+            {names.map((n) => (
+              <button key={n} onClick={() => {
+                // toque junta/tira o trecho do nome (o nome do produto costuma vir quebrado em linhas)
+                const has = form.name.includes(n);
+                const next = has ? form.name.replace(n, "").replace(/\s+/g, " ").trim() : `${form.name} ${n}`.trim();
+                setForm({ ...form, name: next });
+              }} className={`px-2 py-1 rounded-md text-[11px] border ${form.name.includes(n) ? "border-green-500 text-white" : "border-zinc-700 text-zinc-400"}`}>{form.name.includes(n) ? "✓ " : "+ "}{n}</button>
+            ))}
+          </div>
+        )}
+        <p className="font-mono text-[11px] text-zinc-500">
+          valores por 100 g
+          {info && info.basis === "porcao" && ` · convertidos da porção de ${fmtNum(info.portion)} g`}
+          {info && info.basis === "desconhecida" && " · não achei a base da tabela — confira se os valores são por 100 g"}
+        </p>
+        <div className="grid grid-cols-3 gap-2">
+          <Field label="Proteína (g)" value={form.protein} onChange={set("protein")} type="number" />
+          <Field label="Carbo (g)" value={form.carbs} onChange={set("carbs")} type="number" />
+          <Field label="Gordura (g)" value={form.fat} onChange={set("fat")} type="number" />
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Calorias (kcal)" value={form.kcal} onChange={set("kcal")} type="number" placeholder={macroKcal ? String(macroKcal) : ""} />
+          <Field label="Fibra (g)" value={form.fiber} onChange={set("fiber")} type="number" />
+        </div>
+        {macroKcal > 0 && (
+          <p className={`font-mono text-[11px] rounded-lg px-3 py-2 border ${kcalOff ? "text-amber-300 border-amber-900" : "text-zinc-500 border-zinc-800"}`}>
+            pelos macros: {macroKcal} kcal{kcalOff ? " — diferente do lido, confira os números" : ""}
+          </p>
+        )}
+        {missing && missing.length > 0 && <p className="font-mono text-[11px] text-amber-300">não consegui ler: {missing.join(", ")}</p>}
+        <button onClick={save} disabled={!valid} className="mt-1 bg-green-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-black font-semibold rounded-lg py-3 text-[14px]">Salvar e escolher quantidade</button>
+        <button onClick={() => { setStage("photos"); setInfo(null); setNames([]); }} className="text-[12px] text-zinc-500 py-1">tirar outras fotos</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2.5">
+      <PhotoPick label="Frente da embalagem" hint="para o nome do produto (opcional)" file={front} onFile={setFront} />
+      <PhotoPick label="Tabela nutricional" hint="de frente, bem iluminada, sem reflexo" file={label} onFile={setLabel} />
+      {error && <p className="font-mono text-[11px] text-red-300 border border-red-900 rounded-lg px-3 py-2">{error}</p>}
+      <button onClick={read} disabled={!label && !front} className="mt-1 bg-green-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-black font-semibold rounded-lg py-3 text-[14px]">Ler fotos</button>
+      <p className="text-[11px] text-zinc-600 text-center">a leitura é feita no próprio celular; as fotos não são enviadas nem guardadas</p>
+    </div>
+  );
+}
+
 function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFood, onRemoveCustomFood, recipes, onAddRecipe, onRemoveRecipe, onClose }) {
   const editingHasBase = !!(editing && editing.baseFood);
   const [mode, setMode] = useState(editing ? (editingHasBase ? "buscar" : "manual") : "buscar");
@@ -1315,6 +1604,7 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
       {!editing && (
         <div className="flex gap-1 bg-black rounded-lg p-1 border border-zinc-800 mb-3">
           <button onClick={() => setMode("buscar")} className={`flex-1 py-1.5 rounded-md text-[13px] font-medium transition ${mode === "buscar" ? "bg-zinc-800 text-white" : "text-zinc-500"}`}>Buscar</button>
+          <button onClick={() => setMode("foto")} className={`flex-1 py-1.5 rounded-md text-[13px] font-medium transition ${mode === "foto" ? "bg-zinc-800 text-white" : "text-zinc-500"}`}>Foto</button>
           <button onClick={() => setMode("receitas")} className={`flex-1 py-1.5 rounded-md text-[13px] font-medium transition ${mode === "receitas" ? "bg-zinc-800 text-white" : "text-zinc-500"}`}>Receitas</button>
           <button onClick={() => setMode("manual")} className={`flex-1 py-1.5 rounded-md text-[13px] font-medium transition ${mode === "manual" ? "bg-zinc-800 text-white" : "text-zinc-500"}`}>Manual</button>
         </div>
@@ -1322,6 +1612,17 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
 
       {justAdded && (
         <p className="mb-3 font-mono text-[11px] text-green-500 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">✓ {justAdded} lançado — pode adicionar mais ou finalizar</p>
+      )}
+
+      {mode === "foto" && (
+        <PhotoFoodForm
+          onSaved={(food) => {
+            onSaveCustomFood(food);
+            setSelected(food);
+            setUnit("g"); setQty("100"); setGramsPerUnit(String(UNIT_OPTIONS["g"].gramsPerUnit));
+            setMode("buscar");
+          }}
+        />
       )}
 
       {mode === "receitas" && (
@@ -1345,7 +1646,7 @@ function AddFoodModal({ editing, onAdd, onSaveEdit, customFoods, onSaveCustomFoo
         </div>
       )}
 
-      {mode !== "receitas" && (mode === "buscar" ? (
+      {mode !== "receitas" && mode !== "foto" && (mode === "buscar" ? (
         <div className="flex flex-col gap-3">
           {!selected ? (
             <>
