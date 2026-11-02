@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
-<title>Caderno de Treino</title>
+<title>Diário Fit</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -88,7 +88,8 @@ function MiniLineChart({ data, dataKey, color, height = 150 }) {
 
 
 // ---------- helpers ----------
-const todayStr = () => new Date().toISOString().slice(0, 10);
+const localISO = (dt) => `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+const todayStr = () => localISO(new Date());
 const fmtDateLabel = (d) => {
   const dt = new Date(d + "T00:00:00");
   return dt.toLocaleDateString("pt-BR", { weekday: "short", day: "2-digit", month: "short" });
@@ -104,7 +105,7 @@ const toNum = (v) => {
   return isNaN(n) ? 0 : n;
 };
 
-const DEFAULT_PROFILE = { name: "", age: "", sex: "masculino", goal: "manutencao", activityLevel: "moderado", heightCm: 175, refWeight: 80, kcal: 2400, proteinPerKg: 2.0, fatPerKg: 0.9, waterGoalMl: 3000, stepsGoal: "" };
+const DEFAULT_PROFILE = { name: "", age: "", sex: "masculino", goal: "manutencao", activityLevel: "moderado", heightCm: 175, refWeight: 80, kcal: 2400, proteinPerKg: 2.0, fatPerKg: 0.9, waterGoalMl: 3000, stepsGoal: "", trainingDaysPerWeek: 5, weightGoal: "", bodyFatGoal: "", waistGoal: "" };
 
 const ACTIVITY_MULTIPLIERS = { sedentario: 1.2, leve: 1.375, moderado: 1.55, intenso: 1.725, muito_intenso: 1.9 };
 const GOAL_ADJUSTMENTS = { perda: -500, manutencao: 0, ganho: 300 };
@@ -127,7 +128,7 @@ function weekDates(dateStr) {
   for (let i = 0; i < 7; i++) {
     const dt = new Date(monday);
     dt.setDate(monday.getDate() + i);
-    dates.push(dt.toISOString().slice(0, 10));
+    dates.push(localISO(dt));
   }
   return dates;
 }
@@ -160,33 +161,88 @@ function parseXmlAttrs(attrString) {
   return attrs;
 }
 
+// datas do export vêm como "2025-09-14 23:10:00 -0300"
+function parseHKDate(str) {
+  if (!str) return null;
+  const m = str.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})\s*([+-]\d{2})(\d{2})?/);
+  if (!m) { const d = new Date(str); return isNaN(d) ? null : d; }
+  const d = new Date(`${m[1]}T${m[2]}${m[3]}:${m[4] || "00"}`);
+  return isNaN(d) ? null : d;
+}
+
 function makeAppleHealthParser() {
+  // a data do próprio registro (fuso local do iPhone) é o que importa pro dia
   const dateOnly = (iso) => (iso || "").slice(0, 10);
   const weightByDate = {};
-  const stepsByDate = {};
-  const kcalByDate = {};
+  const bodyFatByDate = {};
   const workoutsByDate = {};
+  // somas por fonte: iPhone e Apple Watch registram os mesmos passos/calorias,
+  // então somar tudo dobrava os números. Aqui guardamos por fonte e no fim
+  // usamos a fonte com maior total em cada dia.
+  const perSource = { steps: {}, activeKcal: {}, distanceKm: {}, exerciseMin: {}, sleepMin: {} };
+  const hrByDate = {};
   let recordCount = 0;
   let buffer = "";
-  const SAFETY_TAIL = 4000; // margem generosa: nenhuma tag Record/Workout chega perto disso
+  const SAFETY_TAIL = 4000;
 
   const recordRe = /<Record\b([^>]*?)\/?>/g;
   const workoutRe = /<Workout\b([^>]*?)>/g;
+
+  const addSrc = (metric, date, source, value) => {
+    const byDate = perSource[metric];
+    if (!byDate[date]) byDate[date] = {};
+    byDate[date][source] = (byDate[date][source] || 0) + value;
+  };
 
   function handleRecord(attrStr) {
     recordCount++;
     const attrs = parseXmlAttrs(attrStr);
     const type = attrs.type;
     const date = dateOnly(attrs.startDate);
+    const source = attrs.sourceName || "?";
+    if (!date) return;
+
+    if (type === "HKCategoryTypeIdentifierSleepAnalysis") {
+      // só conta tempo dormindo (ignora "na cama" e "acordado"); vai pro dia em que acordou
+      if (!/Asleep/.test(attrs.value || "")) return;
+      const a = parseHKDate(attrs.startDate), b = parseHKDate(attrs.endDate);
+      if (!a || !b) return;
+      const mins = (b - a) / 60000;
+      if (mins > 0 && mins < 24 * 60) addSrc("sleepMin", dateOnly(attrs.endDate), source, mins);
+      return;
+    }
+
     const value = parseFloat(attrs.value);
-    if (!date || isNaN(value)) return;
-    if (type === "HKQuantityTypeIdentifierBodyMass") {
-      const kg = attrs.unit === "lb" ? value * 0.453592 : value;
-      weightByDate[date] = Math.round(kg * 10) / 10;
-    } else if (type === "HKQuantityTypeIdentifierStepCount") {
-      stepsByDate[date] = (stepsByDate[date] || 0) + value;
-    } else if (type === "HKQuantityTypeIdentifierActiveEnergyBurned") {
-      kcalByDate[date] = (kcalByDate[date] || 0) + value;
+    if (isNaN(value)) return;
+    switch (type) {
+      case "HKQuantityTypeIdentifierBodyMass": {
+        const kg = attrs.unit === "lb" ? value * 0.453592 : value;
+        weightByDate[date] = Math.round(kg * 10) / 10;
+        break;
+      }
+      case "HKQuantityTypeIdentifierBodyFatPercentage":
+        bodyFatByDate[date] = Math.round((value <= 1 ? value * 100 : value) * 10) / 10;
+        break;
+      case "HKQuantityTypeIdentifierStepCount":
+        addSrc("steps", date, source, value);
+        break;
+      case "HKQuantityTypeIdentifierActiveEnergyBurned":
+        addSrc("activeKcal", date, source, attrs.unit === "kJ" ? value / 4.184 : value);
+        break;
+      case "HKQuantityTypeIdentifierDistanceWalkingRunning": {
+        const km = attrs.unit === "mi" ? value * 1.60934 : attrs.unit === "m" ? value / 1000 : value;
+        addSrc("distanceKm", date, source, km);
+        break;
+      }
+      case "HKQuantityTypeIdentifierAppleExerciseTime":
+        addSrc("exerciseMin", date, source, attrs.unit === "s" ? value / 60 : value);
+        break;
+      case "HKQuantityTypeIdentifierRestingHeartRate":
+        if (!hrByDate[date]) hrByDate[date] = [];
+        hrByDate[date].push(value);
+        break;
+      default:
+        break;
     }
   }
 
@@ -195,20 +251,16 @@ function makeAppleHealthParser() {
     const date = dateOnly(attrs.startDate);
     const durationRaw = parseFloat(attrs.duration);
     if (!date || isNaN(durationRaw)) return;
-    const durationMin = attrs.durationUnit === "sec" ? Math.round(durationRaw / 60) : Math.round(durationRaw);
+    const durationMin = attrs.durationUnit === "sec" ? Math.round(durationRaw / 60) : attrs.durationUnit === "hr" ? Math.round(durationRaw * 60) : Math.round(durationRaw);
     const label = WORKOUT_TYPE_LABELS[attrs.workoutActivityType] || "Treino";
     if (!workoutsByDate[date]) workoutsByDate[date] = [];
     workoutsByDate[date].push({ name: `${label} (Apple Watch)`, durationMin });
   }
 
-  // processa um pedaço novo de texto; só "consome" (descarta) o que já
-  // foi processado com segurança, mantendo uma margem no fim caso uma
-  // tag tenha sido cortada bem na fronteira entre dois pedaços do arquivo
   function feed(chunkText, isFinal) {
     buffer += chunkText;
     const safeEnd = isFinal ? buffer.length : Math.max(0, buffer.length - SAFETY_TAIL);
     const region = buffer.slice(0, safeEnd);
-
     let lastConsumed = 0;
     recordRe.lastIndex = 0;
     let m;
@@ -221,12 +273,26 @@ function makeAppleHealthParser() {
       handleWorkout(m[1]);
       lastConsumed = Math.max(lastConsumed, workoutRe.lastIndex);
     }
-
     buffer = buffer.slice(lastConsumed);
   }
 
   function result() {
-    return { weightByDate, stepsByDate, kcalByDate, workoutsByDate, recordCount };
+    const maxBySource = (metric) => {
+      const out = {};
+      Object.entries(perSource[metric]).forEach(([d, bySrc]) => { out[d] = Math.max(...Object.values(bySrc)); });
+      return out;
+    };
+    const restingHrByDate = {};
+    Object.entries(hrByDate).forEach(([d, arr]) => { restingHrByDate[d] = Math.round(arr.reduce((s, v) => s + v, 0) / arr.length); });
+    return {
+      weightByDate, bodyFatByDate, workoutsByDate, recordCount,
+      stepsByDate: maxBySource("steps"),
+      kcalByDate: maxBySource("activeKcal"),
+      distanceByDate: maxBySource("distanceKm"),
+      exerciseByDate: maxBySource("exerciseMin"),
+      sleepByDate: maxBySource("sleepMin"),
+      restingHrByDate,
+    };
   }
 
   return { feed, result };
@@ -542,6 +608,8 @@ function getDayMeals(foodLog, date) {
   return raw;
 }
 
+const SECTION_TITLES = { nutricao: "Dieta", treino: "Treino", medidas: "Medidas", metricas: "Métricas", checkin: "Check-in" };
+
 // ---------- seleção de perfil (uso familiar) ----------
 const ACTIVE_PROFILE_LS_KEY = "diario-active-profile-id";
 
@@ -656,7 +724,7 @@ function AppRoot() {
 
 function DiarioFit({ profileId, onSwitchProfile, profileName }) {
   const pk = (k) => `${profileId}:${k}`;
-  const [tab, setTab] = useState("nutricao");
+  const [tab, setTab] = useState("home");
   const [date, setDate] = useState(todayStr());
   const [loading, setLoading] = useState(true);
 
@@ -670,6 +738,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
   const [waterLog, setWaterLog] = useState({});
   const [recipes, setRecipes] = useState([]);
   const [activityLog, setActivityLog] = useState({});
+  const [checkins, setCheckins] = useState({});
 
   const [showProfile, setShowProfile] = useState(false);
   const [addFoodCtx, setAddFoodCtx] = useState(null); // { mealId, editing } | null
@@ -677,7 +746,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
 
   useEffect(() => {
     (async () => {
-      const [p, f, cf, pl, tl, ce, el, wl, rc, al] = await Promise.all([
+      const [p, f, cf, pl, tl, ce, el, wl, rc, al, ck] = await Promise.all([
         storeGet(pk("profile-goals"), DEFAULT_PROFILE),
         storeGet(pk("food-log"), {}),
         storeGet(pk("custom-foods"), []),
@@ -688,6 +757,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
         storeGet(pk("water-log"), {}),
         storeGet(pk("recipes"), []),
         storeGet(pk("activity-log"), {}),
+        storeGet(pk("checkins"), {}),
       ]);
       setProfile({ ...DEFAULT_PROFILE, ...p });
       setFoodLog(f);
@@ -699,9 +769,26 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
       setWaterLog(wl);
       setRecipes(rc);
       setActivityLog(al);
+      setCheckins(ck || {});
       setLoading(false);
     })();
   }, []);
+
+  useEffect(() => {
+    try { history.replaceState({ tab: "home" }, ""); } catch (e) {}
+    const onPop = (e) => setTab((e.state && e.state.tab) || "home");
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+  const openSection = (id) => {
+    try { history.pushState({ tab: id }, ""); } catch (e) {}
+    setTab(id);
+    window.scrollTo(0, 0);
+  };
+  const goHome = () => {
+    if (history.state && history.state.tab && history.state.tab !== "home") history.back();
+    else setTab("home");
+  };
 
   const macroGoals = useMemo(() => {
     const protein = profile.proteinPerKg * profile.refWeight;
@@ -761,33 +848,73 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
     const next = { ...evolutionLog, [date]: { ...(evolutionLog[date] || {}), ...entry } };
     setEvolutionLog(next); await storeSet(pk("evolution-log"), next);
   };
-  const deleteEvolutionDay = async () => {
+  const saveEvolutionEntry = async (d, entry) => {
+    const clean = Object.fromEntries(Object.entries(entry).filter(([, v]) => v != null));
+    const next = { ...evolutionLog, [d]: { ...(evolutionLog[d] || {}), ...clean } };
+    setEvolutionLog(next);
+    return storeSet(pk("evolution-log"), next);
+  };
+  const deleteEvolutionField = async (d, key) => {
+    const day = { ...(evolutionLog[d] || {}) };
+    delete day[key];
     const next = { ...evolutionLog };
-    delete next[date];
+    if (Object.values(day).some((v) => v != null && v !== "")) next[d] = day; else delete next[d];
     setEvolutionLog(next); await storeSet(pk("evolution-log"), next);
+  };
+  const saveMeasureGoals = async (g) => {
+    const next = { ...profile, ...g };
+    setProfile(next); await storeSet(pk("profile-goals"), next);
+  };
+  const loadCheckinPhotos = (d) => storeGet(pk(`checkin-photos:${d}`), {});
+  const saveCheckin = async (d, photos, measures) => {
+    const r1 = await storeSet(pk(`checkin-photos:${d}`), photos);
+    if (!r1.ok) return { ok: false, message: `erro ao salvar fotos: ${r1.error?.message || r1.error}` };
+    const nextCk = { ...checkins, [d]: { poses: POSES.filter((p) => photos[p.id]).map((p) => p.id), savedAt: new Date().toISOString() } };
+    setCheckins(nextCk);
+    const r2 = await storeSet(pk("checkins"), nextCk);
+    if (!r2.ok) return { ok: false, message: `erro ao salvar check-in: ${r2.error?.message || r2.error}` };
+    await saveEvolutionEntry(d, measures);
+    return { ok: true };
+  };
+  const deleteCheckin = async (d) => {
+    const nextCk = { ...checkins };
+    delete nextCk[d];
+    setCheckins(nextCk);
+    await storeSet(pk("checkins"), nextCk);
+    await storeSet(pk(`checkin-photos:${d}`), {});
   };
 
   const importAppleHealth = async (file, onProgress) => {
-    const { weightByDate, stepsByDate, kcalByDate, workoutsByDate, recordCount } = await parseAppleHealthFileStreaming(file, onProgress);
+    const r = await parseAppleHealthFileStreaming(file, onProgress);
+    const { weightByDate, bodyFatByDate, workoutsByDate, recordCount } = r;
 
-    // peso: só preenche dias que ainda não têm peso lançado manualmente
+    // peso e % gordura: só preenche dias que ainda não têm valor lançado manualmente
     const nextEvo = { ...evolutionLog };
-    let weightAdded = 0;
+    let weightAdded = 0, bodyFatAdded = 0;
     Object.entries(weightByDate).forEach(([d, w]) => {
-      if (!nextEvo[d] || nextEvo[d].weight == null) {
-        nextEvo[d] = { ...(nextEvo[d] || {}), weight: w };
-        weightAdded++;
-      }
+      if (!nextEvo[d] || nextEvo[d].weight == null) { nextEvo[d] = { ...(nextEvo[d] || {}), weight: w }; weightAdded++; }
+    });
+    Object.entries(bodyFatByDate).forEach(([d, bf]) => {
+      if (!nextEvo[d] || nextEvo[d].bodyFat == null) { nextEvo[d] = { ...(nextEvo[d] || {}), bodyFat: bf }; bodyFatAdded++; }
     });
 
-    // atividade: passos e calorias ativas, substitui pelo valor mais recente da importação
+    // atividade: substitui pelo valor mais recente da importação
     const nextActivity = { ...activityLog };
-    const activityDates = new Set([...Object.keys(stepsByDate), ...Object.keys(kcalByDate)]);
+    const fieldMap = [
+      ["steps", r.stepsByDate, 0],
+      ["activeKcal", r.kcalByDate, 0],
+      ["distanceKm", r.distanceByDate, 2],
+      ["exerciseMin", r.exerciseByDate, 0],
+      ["sleepH", Object.fromEntries(Object.entries(r.sleepByDate).map(([d, m]) => [d, m / 60])), 1],
+      ["restingHr", r.restingHrByDate, 0],
+    ];
+    const activityDates = new Set(fieldMap.flatMap(([, byDate]) => Object.keys(byDate)));
     activityDates.forEach((d) => {
-      nextActivity[d] = {
-        steps: stepsByDate[d] != null ? Math.round(stepsByDate[d]) : (nextActivity[d]?.steps ?? null),
-        activeKcal: kcalByDate[d] != null ? Math.round(kcalByDate[d]) : (nextActivity[d]?.activeKcal ?? null),
-      };
+      const day = { ...(nextActivity[d] || {}) };
+      fieldMap.forEach(([key, byDate, dec]) => {
+        if (byDate[d] != null) { const f = Math.pow(10, dec); day[key] = Math.round(byDate[d] * f) / f; }
+      });
+      nextActivity[d] = day;
     });
 
     // treinos: adiciona como avulso, evitando duplicar se já importado antes
@@ -809,7 +936,7 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
     setActivityLog(nextActivity); await storeSet(pk("activity-log"), nextActivity);
     setTrainingLog(nextTraining); await storeSet(pk("training-log"), nextTraining);
 
-    return { weightAdded, workoutsAdded, activityDays: activityDates.size, recordCount };
+    return { weightAdded, bodyFatAdded, workoutsAdded, activityDays: activityDates.size, recordCount };
   };
 
   const dayWaterMl = waterLog[date] || 0;
@@ -839,8 +966,40 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
   const shiftDate = (delta) => {
     const d = new Date(date + "T00:00:00");
     d.setDate(d.getDate() + delta);
-    setDate(d.toISOString().slice(0, 10));
+    setDate(localISO(d));
   };
+
+  const today = todayStr();
+  const weekM = useMemo(
+    () => computeWeekMetrics({ dates: weekDates(today), foodLog, trainingLog, waterLog, activityLog, profile, macroGoals }),
+    [foodLog, trainingLog, waterLog, activityLog, profile, macroGoals, today]
+  );
+  const homeItems = useMemo(() => {
+    const todayFood = dayFoodTotals(foodLog, today);
+    const kcalToday = todayFood ? Math.round(todayFood.kcal) : 0;
+    const kcalGoal = toNum(profile.kcal) || 0;
+    const left = kcalGoal - kcalToday;
+    const tDay = trainingLog[today];
+    const plan = tDay && plans.find((p) => p.id === tDay.planId);
+    const lastOf = (k) => { const s = measureSeries(evolutionLog, k); return s.length ? s[s.length - 1].value : null; };
+    const w = lastOf("weight"), bf = lastOf("bodyFat"), wa = lastOf("waist");
+    const win = checkinWindow(today, checkins);
+    return [
+      { id: "nutricao", label: "Dieta", icon: Flame,
+        summary: kcalToday ? `${kcalToday.toLocaleString("pt-BR")} de ${kcalGoal.toLocaleString("pt-BR")} kcal · ${left >= 0 ? `faltam ${left.toLocaleString("pt-BR")}` : `${Math.abs(left).toLocaleString("pt-BR")} acima`}` : `Nada lançado hoje · meta ${kcalGoal.toLocaleString("pt-BR")} kcal`,
+        progress: kcalGoal ? kcalToday / kcalGoal : null },
+      { id: "treino", label: "Treino", icon: Dumbbell,
+        summary: `${trainedOn(trainingLog, today) ? (plan ? `${plan.name} feito hoje` : "Treino feito hoje") : "Nenhum treino hoje"} · ${weekM.rotina.done}/${weekM.rotina.goal} na semana` },
+      { id: "medidas", label: "Medidas", icon: Ruler,
+        summary: w || bf || wa ? [w && `${fmtNum(w)} kg`, bf && `${fmtNum(bf)}%`, wa && `${fmtNum(wa)} cm`].filter(Boolean).join(" · ") : "Peso, % de gordura e cintura" },
+      { id: "metricas", label: "Métricas", icon: BarChart,
+        summary: `Comprometimento da semana: ${weekM.overall}% · ${commitmentLevel(weekM.overall).label.toLowerCase()}` },
+      { id: "checkin", label: "Check-in", icon: Camera,
+        highlight: !win.done && win.isWeekend,
+        badge: !win.done && win.isWeekend ? "HOJE" : null,
+        summary: win.done ? "Feito nesta semana ✓" : win.isWeekend ? "Disponível agora — fotos + medidas" : `Próximo: ${fmtWeekdayLong(win.nextSat).replace(/ \d{4}$/, "")}` },
+    ];
+  }, [foodLog, trainingLog, plans, evolutionLog, checkins, profile, weekM, today]);
 
   if (loading) {
     return <div className="min-h-screen bg-black flex items-center justify-center"><span className="font-mono text-zinc-400 text-sm tracking-widest">carregando…</span></div>;
@@ -854,41 +1013,24 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
         .font-mono { font-family: 'JetBrains Mono', monospace; }
       `}</style>
 
-      <header className="border-b border-zinc-800 bg-black">
-        <div className="max-w-2xl mx-auto px-5 pt-6 pb-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="font-mono text-[10px] tracking-[0.25em] text-zinc-500 uppercase">{profile.name ? `Diário de ${profile.name}` : "Diário"}</p>
-              <h1 className="font-display text-3xl font-bold leading-none tracking-tight">Caderno de Treino</h1>
-            </div>
-            <button onClick={() => setShowProfile(true)} className="w-9 h-9 rounded-full border border-zinc-700 flex items-center justify-center hover:bg-zinc-800 transition" aria-label="Perfil e metas">
-              <Settings size={16} className="text-zinc-400" />
-            </button>
-          </div>
+      {tab === "home" && (
+        <HomeScreen name={profile.name || profileName} items={homeItems} onOpen={openSection} onSettings={() => setShowProfile(true)} />
+      )}
 
-          <div className="mt-5 flex items-center justify-between bg-zinc-800 rounded-xl px-3 py-2 border border-zinc-800">
-            <button onClick={() => shiftDate(-1)} className="px-2 text-zinc-400 hover:text-white font-mono">‹</button>
-            <div className="flex flex-col items-center">
-              <span className="font-mono text-sm capitalize">{fmtDateLabel(date)}</span>
-              {date !== todayStr() && <button onClick={() => setDate(todayStr())} className="text-[10px] font-mono text-green-500 mt-0.5">voltar para hoje</button>}
+      {tab !== "home" && (
+        <SectionHeader title={SECTION_TITLES[tab]} onBack={goHome}>
+          {(tab === "nutricao" || tab === "treino") && (
+            <div className="mt-3 flex items-center justify-between bg-zinc-900 rounded-xl px-3 py-2 border border-zinc-800">
+              <button onClick={() => shiftDate(-1)} className="px-3 py-1 text-zinc-400 active:text-white font-mono text-lg">‹</button>
+              <div className="flex flex-col items-center">
+                <span className="font-mono text-sm capitalize">{fmtDateLabel(date)}</span>
+                {date !== todayStr() && <button onClick={() => setDate(todayStr())} className="text-[10px] font-mono text-green-500 mt-0.5">voltar para hoje</button>}
+              </div>
+              <button onClick={() => shiftDate(1)} className="px-3 py-1 text-zinc-400 active:text-white font-mono text-lg">›</button>
             </div>
-            <button onClick={() => shiftDate(1)} className="px-2 text-zinc-400 hover:text-white font-mono">›</button>
-          </div>
-
-          <div className="mt-4 flex gap-1 bg-zinc-900 rounded-xl p-1 border border-zinc-800 overflow-x-auto">
-            {[
-              { id: "nutricao", label: "Nutrição", icon: Flame },
-              { id: "treino", label: "Treino", icon: Dumbbell },
-              { id: "evolucao", label: "Evolução", icon: TrendingUp },
-              { id: "checkin", label: "Acompanhamento", icon: CalendarCheck },
-            ].map(({ id, label, icon: Icon }) => (
-              <button key={id} onClick={() => setTab(id)} className={`flex-shrink-0 whitespace-nowrap flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-[13px] font-medium transition ${tab === id ? "bg-zinc-800 text-white" : "text-zinc-500 hover:text-zinc-400"}`}>
-                <Icon size={14} />{label}
-              </button>
-            ))}
-          </div>
-        </div>
-      </header>
+          )}
+        </SectionHeader>
+      )}
 
       <main className="max-w-2xl mx-auto px-5 pb-28">
         {tab === "nutricao" && (
@@ -918,22 +1060,23 @@ function DiarioFit({ profileId, onSwitchProfile, profileName }) {
             onManagePlans={() => setShowPlanManager(true)}
           />
         )}
-        {tab === "evolucao" && <EvolucaoTab evolutionLog={evolutionLog} date={date} heightCm={profile.heightCm} onSave={saveEvolutionDay} onDelete={deleteEvolutionDay} activityLog={activityLog} />}
-        {tab === "checkin" && (
-          <CheckinTab
-            date={date}
+        {tab === "medidas" && (
+          <MedidasTab evolutionLog={evolutionLog} profile={profile} onSaveEntry={saveEvolutionEntry} onDeleteField={deleteEvolutionField} onSaveGoals={saveMeasureGoals} />
+        )}
+        {tab === "metricas" && (
+          <MetricasTab
             foodLog={foodLog}
             trainingLog={trainingLog}
-            evolutionLog={evolutionLog}
-            kcalGoal={profile.kcal}
-            macroGoals={macroGoals}
             waterLog={waterLog}
-            waterGoalMl={profile.waterGoalMl}
             activityLog={activityLog}
-            stepsGoal={profile.stepsGoal}
+            profile={profile}
+            macroGoals={macroGoals}
             onImportAppleHealth={importAppleHealth}
             profileName={profile.name || profileName}
           />
+        )}
+        {tab === "checkin" && (
+          <CheckinTab checkins={checkins} evolutionLog={evolutionLog} heightCm={profile.heightCm} loadPhotos={loadCheckinPhotos} onSave={saveCheckin} onDelete={deleteCheckin} />
         )}
       </main>
 
@@ -1583,480 +1726,941 @@ function PlanManagerModal({ plans, onChange, onClose }) {
 }
 
 // ---------- Evolução ----------
-function EvolucaoTab({ evolutionLog, date, heightCm, onSave, onDelete, activityLog }) {
-  const entry = evolutionLog[date] || {};
-  const [weight, setWeight] = useState(entry.weight || "");
-  const [neck, setNeck] = useState(entry.neck || "");
-  const [waist, setWaist] = useState(entry.waist || "");
-  const [showMore, setShowMore] = useState(false);
-  const [chest, setChest] = useState(entry.chest || "");
-  const [hip, setHip] = useState(entry.hip || "");
-  const [arm, setArm] = useState(entry.arm || "");
-  const [thigh, setThigh] = useState(entry.thigh || "");
-  const [notes, setNotes] = useState(entry.notes || "");
-  const [photo, setPhoto] = useState(entry.photo || null);
-  const fileRef = useRef(null);
+// =====================================================================
+// TELA INICIAL + MEDIDAS + MÉTRICAS + CHECK-IN
+// =====================================================================
 
-  useEffect(() => {
-    const e = evolutionLog[date] || {};
-    setWeight(e.weight || ""); setNeck(e.neck || ""); setWaist(e.waist || "");
-    setChest(e.chest || ""); setHip(e.hip || ""); setArm(e.arm || ""); setThigh(e.thigh || "");
-    setNotes(e.notes || ""); setPhoto(e.photo || null);
-  }, [date, evolutionLog]);
+const MONTHS_PT = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+const WEEKDAYS_PT = ["Dom.", "Seg.", "Ter.", "Qua.", "Qui.", "Sex.", "Sáb."];
+const fmtLong = (s) => { const d = new Date(s + "T00:00:00"); return `${String(d.getDate()).padStart(2, "0")} ${MONTHS_PT[d.getMonth()]}. ${d.getFullYear()}`; };
+const fmtWeekdayLong = (s) => { const d = new Date(s + "T00:00:00"); return `${WEEKDAYS_PT[d.getDay()]}, ${fmtLong(s)}`; };
+const fmtDM = (s) => `${s.slice(8, 10)}/${s.slice(5, 7)}`;
+const fmtNum = (n, dec = 1) => (n == null || n === "" || isNaN(n) ? "–" : Number(n).toLocaleString("pt-BR", { maximumFractionDigits: dec }));
+const addDays = (s, n) => { const d = new Date(s + "T00:00:00"); d.setDate(d.getDate() + n); return localISO(d); };
+const spanLabel = (a, b) => {
+  const days = Math.round((new Date(b + "T00:00:00") - new Date(a + "T00:00:00")) / 86400000);
+  if (days < 1) return "hoje";
+  if (days < 30) return `em ${days} ${days === 1 ? "dia" : "dias"}`;
+  const months = Math.round(days / 30);
+  return `em ${months} ${months === 1 ? "mês" : "meses"}`;
+};
 
-  const bodyFatPreview = navyBodyFat({ neck, waist, heightCm });
+const ArrowLeft = (p) => <Icon {...p}><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></Icon>;
+const ChevronRight = (p) => <Icon {...p}><polyline points="9 6 15 12 9 18" /></Icon>;
+const ChevronLeft = (p) => <Icon {...p}><polyline points="15 6 9 12 15 18" /></Icon>;
+const Ruler = (p) => <Icon {...p}><rect x="2" y="8" width="20" height="8" rx="1.5" /><line x1="6" y1="8" x2="6" y2="11" /><line x1="10" y1="8" x2="10" y2="12" /><line x1="14" y1="8" x2="14" y2="11" /><line x1="18" y1="8" x2="18" y2="12" /></Icon>;
+const BarChart = (p) => <Icon {...p}><line x1="6" y1="20" x2="6" y2="13" /><line x1="12" y1="20" x2="12" y2="6" /><line x1="18" y1="20" x2="18" y2="10" /><line x1="3" y1="20" x2="21" y2="20" /></Icon>;
+const Target = (p) => <Icon {...p}><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="5" /><circle cx="12" cy="12" r="1" /></Icon>;
 
-  const handlePhoto = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const dataUrl = await compressImage(file);
-    setPhoto(dataUrl);
+// ---------- comprometimento ----------
+function commitmentLevel(pct) {
+  if (pct < 40) return { label: "BAIXO", color: "#F87171" };
+  if (pct < 80) return { label: "NORMAL", color: "#FBBF24" };
+  return { label: "ÓTIMO", color: "#22C55E" };
+}
+
+function weekStreak(dates, okFn) {
+  let max = 0, cur = 0;
+  dates.forEach((d) => { if (okFn(d)) { cur++; max = Math.max(max, cur); } else cur = 0; });
+  return max;
+}
+
+function dayFoodTotals(foodLog, d) {
+  const meals = foodLog[d];
+  if (!meals) return null;
+  const items = Array.isArray(meals) ? meals : Object.values(meals).flat();
+  if (items.length === 0) return null;
+  return items.reduce((a, f) => ({
+    kcal: a.kcal + toNum(f.kcal), protein: a.protein + toNum(f.protein), carbs: a.carbs + toNum(f.carbs), fat: a.fat + toNum(f.fat),
+  }), { kcal: 0, protein: 0, carbs: 0, fat: 0 });
+}
+
+function trainedOn(trainingLog, d) {
+  const t = trainingLog[d];
+  if (!t) return false;
+  return (t.adhoc && t.adhoc.length > 0) || (t.progress && Object.values(t.progress).some((p) => toNum(p.doneSets) > 0));
+}
+
+// calcula tudo de uma semana — usado na tela inicial e em Métricas
+function computeWeekMetrics({ dates, foodLog, trainingLog, waterLog, activityLog, profile, macroGoals }) {
+  const today = todayStr();
+  const elapsed = dates.filter((d) => d <= today);
+  const nDays = Math.max(1, elapsed.length);
+  const avg = (vals) => (vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : null);
+
+  // treinos
+  const trainingGoal = toNum(profile.trainingDaysPerWeek) || 5;
+  const trainedSet = new Set(dates.filter((d) => trainedOn(trainingLog, d)));
+  const trainedDays = trainedSet.size;
+  const workoutMins = dates.map((d) => (trainingLog[d]?.adhoc || []).reduce((s, a) => s + toNum(a.durationMin), 0)).filter((m) => m > 0);
+  const rotina = {
+    done: trainedDays, goal: trainingGoal,
+    pct: Math.min(100, Math.round((trainedDays / trainingGoal) * 100)),
+    dots: dates.map((d) => (trainedSet.has(d) ? "ok" : d <= today ? "miss" : "future")),
+    streak: weekStreak(dates, (d) => trainedSet.has(d)),
+    avgMinutes: workoutMins.length ? Math.round(workoutMins.reduce((s, v) => s + v, 0) / nDays) : null,
   };
 
-  const save = () => {
-    onSave({ weight: toNum(weight) || null, neck: toNum(neck) || null, waist: toNum(waist) || null, chest: toNum(chest) || null, hip: toNum(hip) || null, arm: toNum(arm) || null, thigh: toNum(thigh) || null, bodyFat: bodyFatPreview, notes, photo });
+  // nutrição — nota diária = quão perto ficou da meta (dias sem registro contam zero)
+  const kcalGoal = toNum(profile.kcal) || 0;
+  const foodDays = dates.map((d) => [d, dayFoodTotals(foodLog, d)]).filter(([, t]) => t && t.kcal > 0);
+  const foodMap = Object.fromEntries(foodDays);
+  const scoreOf = (k) => (kcalGoal ? Math.max(0, 1 - Math.abs(k - kcalGoal) / kcalGoal) : 0);
+  const nutriOk = (d) => foodMap[d] && kcalGoal && Math.abs(foodMap[d].kcal - kcalGoal) / kcalGoal <= 0.1;
+  const nutricao = {
+    avgKcal: foodDays.length ? Math.round(avg(foodDays.map(([, t]) => t.kcal))) : null,
+    goal: kcalGoal,
+    pct: Math.round((foodDays.reduce((s, [, t]) => s + scoreOf(t.kcal), 0) / nDays) * 100),
+    successDays: dates.filter(nutriOk).length,
+    streak: weekStreak(dates, nutriOk),
+    dots: dates.map((d) => (nutriOk(d) ? "ok" : foodMap[d] ? "partial" : d <= today ? "miss" : "future")),
+    protein: foodDays.length ? Math.round(avg(foodDays.map(([, t]) => t.protein))) : null,
+    carbs: foodDays.length ? Math.round(avg(foodDays.map(([, t]) => t.carbs))) : null,
+    fat: foodDays.length ? Math.round(avg(foodDays.map(([, t]) => t.fat))) : null,
+    goals: macroGoals,
   };
 
-  const sortedEntries = Object.entries(evolutionLog).sort(([a], [b]) => a.localeCompare(b));
-  const weightChart = sortedEntries.filter(([, v]) => v.weight).map(([d, v]) => ({ date: fmtShort(d), peso: v.weight }));
-  const bfChart = sortedEntries.filter(([, v]) => v.bodyFat).map(([d, v]) => ({ date: fmtShort(d), gordura: v.bodyFat }));
-  const photos = sortedEntries.filter(([, v]) => v.photo).reverse();
+  // água
+  const waterGoal = toNum(profile.waterGoalMl) || 0;
+  const waterDays = dates.filter((d) => toNum(waterLog[d]) > 0);
+  const waterOk = (d) => waterGoal && toNum(waterLog[d]) >= waterGoal;
+  const agua = {
+    avg: waterDays.length ? Math.round(avg(waterDays.map((d) => toNum(waterLog[d])))) : null,
+    goal: waterGoal,
+    pct: waterGoal ? Math.min(100, Math.round((dates.reduce((s, d) => s + Math.min(1, toNum(waterLog[d]) / waterGoal), 0) / nDays) * 100)) : 0,
+    successDays: dates.filter(waterOk).length,
+    streak: weekStreak(dates, waterOk),
+    dots: dates.map((d) => (waterOk(d) ? "ok" : toNum(waterLog[d]) > 0 ? "partial" : d <= today ? "miss" : "future")),
+  };
 
-  const lastWeight = weightChart[weightChart.length - 1];
-  const firstWeight = weightChart[0];
-  const weightDelta = lastWeight && firstWeight && weightChart.length > 1 ? (lastWeight.peso - firstWeight.peso).toFixed(1) : null;
+  // Apple Health
+  const act = (key) => dates.map((d) => activityLog[d]?.[key]).filter((v) => v != null && !isNaN(v));
+  const stepsGoal = toNum(profile.stepsGoal) || 0;
+  const stepsVals = act("steps");
+  const stepsOk = (d) => stepsGoal && toNum(activityLog[d]?.steps) >= stepsGoal;
+  const passos = stepsVals.length ? {
+    avg: Math.round(avg(stepsVals)), goal: stepsGoal,
+    pct: stepsGoal ? Math.min(100, Math.round((dates.reduce((s, d) => s + Math.min(1, toNum(activityLog[d]?.steps) / stepsGoal), 0) / nDays) * 100)) : null,
+    successDays: dates.filter(stepsOk).length,
+    streak: weekStreak(dates, stepsOk),
+    dots: dates.map((d) => (stepsOk(d) ? "ok" : activityLog[d]?.steps != null ? "partial" : d <= today ? "miss" : "future")),
+  } : null;
+  const kcalVals = act("activeKcal"), distVals = act("distanceKm"), exVals = act("exerciseMin"), sleepVals = act("sleepH"), hrVals = act("restingHr");
+  const atividade = (kcalVals.length || distVals.length || exVals.length) ? {
+    activeKcal: kcalVals.length ? Math.round(avg(kcalVals)) : null,
+    distanceKm: distVals.length ? Math.round(avg(distVals) * 10) / 10 : null,
+    exerciseMin: exVals.length ? Math.round(avg(exVals)) : null,
+  } : null;
+  const recuperacao = (sleepVals.length || hrVals.length) ? {
+    sleepH: sleepVals.length ? Math.round(avg(sleepVals) * 10) / 10 : null,
+    restingHr: hrVals.length ? Math.round(avg(hrVals)) : null,
+  } : null;
+
+  const parts = [rotina.pct, nutricao.pct, waterGoal ? agua.pct : null, passos && passos.pct != null ? passos.pct : null].filter((v) => v != null);
+  const overall = parts.length ? Math.round(parts.reduce((s, v) => s + v, 0) / parts.length) : 0;
+
+  return { rotina, nutricao, agua, passos, atividade, recuperacao, overall };
+}
+
+// ---------- tela inicial ----------
+function HomeScreen({ name, items, onOpen, onSettings }) {
+  const now = new Date();
+  const rawLabel = now.toLocaleDateString("pt-BR", { weekday: "long", day: "numeric", month: "long" });
+  const dateLabel = rawLabel.charAt(0).toUpperCase() + rawLabel.slice(1);
+  return (
+    <div className="max-w-2xl mx-auto px-5 pt-8 pb-16">
+      <div className="flex items-start justify-between">
+        <div>
+          <p className="font-mono text-[10px] tracking-[0.25em] text-zinc-500 uppercase">Diário Fit</p>
+          <h1 className="font-display text-4xl font-bold leading-tight tracking-tight">{name ? `Olá, ${name}` : "Olá"}</h1>
+          <p className="text-[13px] text-zinc-500 mt-0.5">{dateLabel}</p>
+        </div>
+        <button onClick={onSettings} className="w-11 h-11 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center active:bg-zinc-800 transition" aria-label="Perfil e metas">
+          <Settings size={18} className="text-zinc-400" />
+        </button>
+      </div>
+
+      <div className="mt-7 flex flex-col gap-3">
+        {items.map((it) => {
+          const IconC = it.icon;
+          return (
+            <button
+              key={it.id}
+              onClick={() => onOpen(it.id)}
+              className={`w-full text-left rounded-3xl bg-zinc-900 border ${it.highlight ? "border-green-500" : "border-zinc-800"} active:scale-[0.98] active:bg-zinc-800 transition px-5 py-5 min-h-[112px] flex items-center gap-4`}
+            >
+              <div className={`w-14 h-14 flex-shrink-0 rounded-2xl flex items-center justify-center ${it.highlight ? "bg-green-500 text-black" : "bg-black border border-zinc-800 text-green-500"}`}>
+                <IconC size={26} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <p className="font-display text-[32px] leading-none font-bold tracking-wide uppercase whitespace-nowrap">{it.label}</p>
+                  {it.badge && <span className="font-mono text-[9px] tracking-wider px-2 py-1 rounded-full bg-green-500 text-black font-semibold">{it.badge}</span>}
+                </div>
+                <p className="mt-1.5 text-[13px] text-zinc-400 leading-snug">{it.summary}</p>
+                {it.progress != null && (
+                  <div className="mt-2.5 h-[5px] rounded-full bg-zinc-800 overflow-hidden">
+                    <div className="h-full rounded-full transition-all duration-500" style={{ width: `${Math.min(100, it.progress * 100)}%`, background: it.progress > 1.05 ? "#FFFFFF" : "#22C55E" }} />
+                  </div>
+                )}
+              </div>
+              <ChevronRight size={22} className="text-zinc-600 flex-shrink-0" />
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// cabeçalho das telas internas
+function SectionHeader({ title, onBack, right, children }) {
+  return (
+    <header className="sticky top-0 z-10 bg-black border-b border-zinc-800">
+      <div className="max-w-2xl mx-auto px-5 pt-5 pb-3">
+        <div className="flex items-center gap-3">
+          <button onClick={onBack} className="w-10 h-10 flex-shrink-0 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center active:bg-zinc-800" aria-label="Voltar">
+            <ArrowLeft size={18} />
+          </button>
+          <h1 className="font-display text-[26px] font-bold uppercase tracking-wide flex-1 leading-none">{title}</h1>
+          {right}
+        </div>
+        {children}
+      </div>
+    </header>
+  );
+}
+
+// ---------- gráfico de medida com linha de objetivo ----------
+function MeasureChart({ points, goal, unit }) {
+  if (!points || points.length === 0) return null;
+  const W = 340, H = 220, padL = 30, padR = 14, padT = 14, padB = 24;
+  const values = points.map((p) => p.value);
+  const all = goal != null ? [...values, goal] : values;
+  let lo = Math.min(...all), hi = Math.max(...all);
+  const span = Math.max(1, hi - lo);
+  lo = Math.floor(lo - span * 0.08); hi = Math.ceil(hi + span * 0.08);
+  const rawStep = (hi - lo) / 4;
+  const step = rawStep <= 1 ? 1 : rawStep <= 2 ? 2 : rawStep <= 5 ? 5 : Math.ceil(rawStep / 5) * 5;
+  lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
+  const ticks = []; for (let v = lo; v <= hi + 1e-9; v += step) ticks.push(v);
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const xOf = (i) => padL + (points.length > 1 ? (i / (points.length - 1)) * innerW : innerW / 2);
+  const yOf = (v) => padT + innerH - ((v - lo) / (hi - lo || 1)) * innerH;
+  const line = points.map((p, i) => `${i ? "L" : "M"}${xOf(i).toFixed(1)},${yOf(p.value).toFixed(1)}`).join(" ");
+  const area = `${line} L${xOf(points.length - 1).toFixed(1)},${padT + innerH} L${xOf(0).toFixed(1)},${padT + innerH} Z`;
+  const labelIdx = points.length <= 5 ? points.map((_, i) => i) : [0, 1, 2, 3, 4].map((k) => Math.round((k / 4) * (points.length - 1)));
+  const gid = "g" + Math.random().toString(36).slice(2, 7);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: "block" }}>
+      <defs>
+        <linearGradient id={gid} x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stopColor="#FFFFFF" stopOpacity="0.16" />
+          <stop offset="100%" stopColor="#FFFFFF" stopOpacity="0.02" />
+        </linearGradient>
+      </defs>
+      {ticks.map((t) => (
+        <g key={t}>
+          <line x1={padL} x2={W - padR} y1={yOf(t)} y2={yOf(t)} stroke="#3F3F46" strokeDasharray="4 4" strokeWidth="0.8" />
+          <text x={padL - 6} y={yOf(t) + 3} fontSize="9" fill="#71717A" textAnchor="end" fontFamily="JetBrains Mono, monospace">{t}</text>
+        </g>
+      ))}
+      <path d={area} fill={`url(#${gid})`} />
+      <path d={line} fill="none" stroke="#F4F1E8" strokeWidth="2" strokeLinejoin="round" />
+      {points.length <= 40 && points.map((p, i) => <circle key={i} cx={xOf(i)} cy={yOf(p.value)} r="2.8" fill="#F4F1E8" />)}
+      {goal != null && (
+        <g>
+          <line x1={padL} x2={W - padR} y1={yOf(goal)} y2={yOf(goal)} stroke="#22C55E" strokeDasharray="5 4" strokeWidth="1.2" />
+          <text x={W - padR} y={yOf(goal) - 5} fontSize="9" fill="#22C55E" textAnchor="end" fontFamily="JetBrains Mono, monospace" letterSpacing="1">OBJETIVO {fmtNum(goal)}{unit}</text>
+        </g>
+      )}
+      {labelIdx.map((i) => (
+        <text key={i} x={xOf(i)} y={H - 6} fontSize="9" fill="#71717A" textAnchor={i === 0 ? "start" : i === points.length - 1 ? "end" : "middle"} fontFamily="JetBrains Mono, monospace">{fmtDM(points[i].date)}</text>
+      ))}
+    </svg>
+  );
+}
+
+// ---------- MEDIDAS ----------
+const MEASURES = [
+  { key: "weight", label: "Peso", unit: "kg", goalKey: "weightGoal" },
+  { key: "bodyFat", label: "Gordura Corporal", unit: "%", goalKey: "bodyFatGoal" },
+  { key: "waist", label: "Cintura", unit: "cm", goalKey: "waistGoal" },
+];
+
+function measureSeries(evolutionLog, key) {
+  return Object.entries(evolutionLog)
+    .filter(([, v]) => v && v[key] != null && v[key] !== "" && !isNaN(v[key]))
+    .map(([date, v]) => ({ date, value: Number(v[key]) }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function measureStats(series, goal) {
+  if (series.length === 0) return null;
+  const first = series[0], last = series[series.length - 1];
+  const delta = Math.round((last.value - first.value) * 10) / 10;
+  let progress = null, achieved = null, needed = null;
+  const g = goal === "" || goal == null ? null : toNum(goal);
+  if (g != null && g !== first.value) {
+    needed = Math.round(Math.abs(first.value - g) * 10) / 10;
+    achieved = Math.round(((first.value - last.value) * Math.sign(first.value - g)) * 10) / 10;
+    progress = clamp(achieved / needed, 0, 1);
+  }
+  return { first, last, delta, goal: g, progress, achieved, needed, span: spanLabel(first.date, last.date) };
+}
+
+function MedidasTab({ evolutionLog, profile, onSaveEntry, onDeleteField, onSaveGoals }) {
+  const [view, setView] = useState("home"); // home | weight | bodyFat | waist
+  const [showForm, setShowForm] = useState(false);
+  const [showGoals, setShowGoals] = useState(false);
+
+  if (view !== "home") {
+    const m = MEASURES.find((x) => x.key === view);
+    const series = measureSeries(evolutionLog, m.key);
+    const st = measureStats(series, profile[m.goalKey]);
+    return (
+      <div className="pt-5">
+        <button onClick={() => setView("home")} className="flex items-center gap-1 text-[13px] text-zinc-400 mb-3"><ChevronLeft size={15} /> Medidas</button>
+        <h2 className="font-display text-3xl font-bold tracking-tight mb-4">{m.label}</h2>
+        {!st ? (
+          <p className="text-center text-[13px] text-zinc-500 font-mono py-10">nenhum registro ainda</p>
+        ) : (
+          <>
+            <div className="bg-zinc-900 border border-zinc-800 rounded-3xl px-5 py-5 flex items-center justify-between">
+              <div>
+                <p className="font-mono text-4xl font-semibold tabular-nums">{fmtNum(st.last.value)}<span className="text-[15px] text-zinc-400"> {m.unit}</span></p>
+                <p className="text-[13px] text-zinc-500 mt-1">{fmtLong(st.last.date)}</p>
+              </div>
+              <div className="text-right">
+                {st.goal != null ? (
+                  <p className="font-mono text-2xl font-semibold tabular-nums">
+                    <span style={{ color: st.achieved > 0 ? "#22C55E" : "#FFFFFF" }}>{st.achieved > 0 ? "↓" : "→"}</span> {fmtNum(Math.max(0, st.achieved))}<span className="text-[15px] text-zinc-400"> / {fmtNum(st.needed)} {m.unit}</span>
+                  </p>
+                ) : (
+                  <p className="font-mono text-2xl font-semibold tabular-nums">{st.delta < 0 ? "↓" : st.delta > 0 ? "↑" : "→"} {fmtNum(Math.abs(st.delta))}<span className="text-[15px] text-zinc-400"> {m.unit}</span></p>
+                )}
+                <p className="text-[13px] text-zinc-500 mt-1">{st.span}</p>
+              </div>
+            </div>
+            {st.goal != null && (
+              <div className="mt-3 px-1">
+                <div className="h-[6px] rounded-full bg-zinc-800 overflow-hidden"><div className="h-full rounded-full bg-green-500 transition-all" style={{ width: `${(st.progress || 0) * 100}%` }} /></div>
+                <p className="font-mono text-[11px] text-zinc-500 mt-1.5">{Math.round((st.progress || 0) * 100)}% do caminho até {fmtNum(st.goal)} {m.unit}</p>
+              </div>
+            )}
+            <div className="mt-4 bg-zinc-900 border border-zinc-800 rounded-3xl px-3 py-4">
+              <MeasureChart points={series} goal={st.goal} unit={m.unit} />
+            </div>
+            <div className="mt-4 bg-zinc-900 border border-zinc-800 rounded-3xl px-5">
+              {[...series].reverse().map((p, i) => (
+                <div key={p.date} className={`flex items-center justify-between py-4 ${i ? "border-t border-zinc-800" : ""}`}>
+                  <span className="text-[15px] text-zinc-400">{fmtLong(p.date)}</span>
+                  <div className="flex items-center gap-3">
+                    <span className="font-mono text-[17px] font-semibold tabular-nums">{fmtNum(p.value)}<span className="text-[13px] text-zinc-400 font-normal"> {m.unit}</span></span>
+                    <button onClick={() => { if (confirm(`Apagar ${m.label.toLowerCase()} de ${fmtLong(p.date)}?`)) onDeleteField(p.date, m.key); }} className="text-zinc-600 active:text-white p-1" aria-label="Apagar registro"><Trash2 size={15} /></button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    );
+  }
 
   return (
-    <div className="pt-6">
-      <h2 className="font-display text-xl font-semibold tracking-tight mb-4">Medidas de hoje</h2>
+    <div className="pt-5 flex flex-col gap-3">
+      <div className="grid grid-cols-2 gap-2">
+        <button onClick={() => setShowForm(true)} className="bg-green-500 text-black font-semibold rounded-2xl py-3.5 text-[15px] flex items-center justify-center gap-1.5 active:brightness-90"><Plus size={17} /> Lançar medidas</button>
+        <button onClick={() => setShowGoals(true)} className="bg-zinc-900 border border-zinc-800 rounded-2xl py-3.5 text-[15px] flex items-center justify-center gap-1.5 active:bg-zinc-800"><Target size={17} className="text-green-500" /> Metas</button>
+      </div>
 
-      {activityLog[date] && (activityLog[date].steps != null || activityLog[date].activeKcal != null) && (
-        <div className="mb-4 grid grid-cols-2 gap-3">
-          {activityLog[date].steps != null && (
-            <div className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">
-              <p className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Passos</p>
-              <p className="font-mono text-lg font-semibold">{activityLog[date].steps.toLocaleString("pt-BR")}</p>
+      {MEASURES.map((m) => {
+        const series = measureSeries(evolutionLog, m.key);
+        const st = measureStats(series, profile[m.goalKey]);
+        return (
+          <button key={m.key} onClick={() => setView(m.key)} className="text-left bg-zinc-900 border border-zinc-800 rounded-3xl px-5 py-5 active:bg-zinc-800 transition">
+            <div className="flex items-center justify-between">
+              <p className="text-[15px] text-zinc-300">{m.label}</p>
+              <ChevronRight size={18} className="text-zinc-600" />
             </div>
-          )}
-          {activityLog[date].activeKcal != null && (
-            <div className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">
-              <p className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Kcal ativas</p>
-              <p className="font-mono text-lg font-semibold">{activityLog[date].activeKcal}</p>
-            </div>
-          )}
-        </div>
-      )}
+            {st ? (
+              <>
+                <div className="mt-2 flex items-end justify-between">
+                  <div>
+                    <p className="font-mono text-[34px] leading-none font-semibold tabular-nums">{fmtNum(st.last.value)}<span className="text-[14px] text-zinc-400"> {m.unit}</span></p>
+                    <p className="text-[12px] text-zinc-500 mt-1.5">{fmtLong(st.last.date)}</p>
+                  </div>
+                  {series.length > 1 && (
+                    <div className="text-right">
+                      <p className="font-mono text-[16px] font-semibold">{st.delta < 0 ? "↓" : st.delta > 0 ? "↑" : "→"} {fmtNum(Math.abs(st.delta))} {m.unit}</p>
+                      <p className="text-[12px] text-zinc-500">{st.span}</p>
+                    </div>
+                  )}
+                </div>
+                {st.goal != null && (
+                  <div className="mt-3">
+                    <div className="h-[5px] rounded-full bg-zinc-800 overflow-hidden"><div className="h-full rounded-full bg-green-500" style={{ width: `${(st.progress || 0) * 100}%` }} /></div>
+                    <p className="font-mono text-[11px] text-zinc-500 mt-1.5">meta {fmtNum(st.goal)} {m.unit} · {Math.round((st.progress || 0) * 100)}% do caminho</p>
+                  </div>
+                )}
+              </>
+            ) : (
+              <p className="mt-2 font-mono text-[12px] text-zinc-500">sem registros</p>
+            )}
+          </button>
+        );
+      })}
 
-      <div className="grid grid-cols-3 gap-3">
+      {showForm && <MeasureEntryModal evolutionLog={evolutionLog} heightCm={profile.heightCm} onSave={(d, e) => { onSaveEntry(d, e); setShowForm(false); }} onClose={() => setShowForm(false)} />}
+      {showGoals && <MeasureGoalsModal profile={profile} onSave={(g) => { onSaveGoals(g); setShowGoals(false); }} onClose={() => setShowGoals(false)} />}
+    </div>
+  );
+}
+
+// formulário de medidas reaproveitado em Medidas e no Check-in
+function useMeasureForm(entry, heightCm) {
+  const init = (k) => (entry && entry[k] != null ? String(entry[k]).replace(".", ",") : "");
+  const [weight, setWeight] = useState(init("weight"));
+  const [neck, setNeck] = useState(init("neck"));
+  const [waist, setWaist] = useState(init("waist"));
+  const [bfManual, setBfManual] = useState(entry && entry.bodyFat != null && !navyBodyFat({ neck: entry.neck, waist: entry.waist, heightCm }) ? String(entry.bodyFat).replace(".", ",") : "");
+  const bfAuto = navyBodyFat({ neck, waist, heightCm });
+  const bodyFat = bfManual !== "" ? toNum(bfManual) || null : bfAuto;
+  const reset = (e) => {
+    const g = (k) => (e && e[k] != null ? String(e[k]).replace(".", ",") : "");
+    setWeight(g("weight")); setNeck(g("neck")); setWaist(g("waist"));
+    setBfManual(e && e.bodyFat != null && !navyBodyFat({ neck: e.neck, waist: e.waist, heightCm }) ? String(e.bodyFat).replace(".", ",") : "");
+  };
+  const values = () => ({ weight: toNum(weight) || null, neck: toNum(neck) || null, waist: toNum(waist) || null, bodyFat: bodyFat || null });
+  const fields = (
+    <div className="flex flex-col gap-3">
+      <div className="grid grid-cols-3 gap-2">
         <Field label="Peso (kg)" value={weight} onChange={(e) => setWeight(e.target.value)} type="number" />
         <Field label="Pescoço (cm)" value={neck} onChange={(e) => setNeck(e.target.value)} type="number" />
         <Field label="Cintura (cm)" value={waist} onChange={(e) => setWaist(e.target.value)} type="number" />
       </div>
+      <div className="flex items-center justify-between bg-black border border-zinc-800 rounded-lg px-3 py-2">
+        <span className="font-mono text-[11px] text-zinc-500 uppercase tracking-wider">% gordura {bfManual !== "" ? "(manual)" : "(marinha EUA)"}</span>
+        <span className="font-mono text-[15px] font-semibold text-green-500">{bodyFat ? `${fmtNum(bodyFat)}%` : "–"}</span>
+      </div>
+      <Field label="% gordura manual (bioimpedância, opcional)" value={bfManual} onChange={(e) => setBfManual(e.target.value)} type="number" placeholder="deixe vazio para calcular" />
+    </div>
+  );
+  return { fields, values, reset };
+}
 
-      {bodyFatPreview !== null && (
-        <div className="mt-3 flex items-center gap-2 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">
-          <span className="font-mono text-[11px] text-zinc-500 uppercase tracking-wider">% gordura estimado</span>
-          <span className="font-mono text-[15px] font-semibold text-green-500">{bodyFatPreview}%</span>
+function MeasureEntryModal({ evolutionLog, heightCm, onSave, onClose }) {
+  const [d, setD] = useState(todayStr());
+  const form = useMeasureForm(evolutionLog[todayStr()], heightCm);
+  useEffect(() => { form.reset(evolutionLog[d]); }, [d]);
+  return (
+    <Modal title="Lançar medidas" onClose={onClose}>
+      <div className="flex flex-col gap-3">
+        <label className="flex flex-col gap-1">
+          <span className="text-[11px] font-mono uppercase tracking-wider text-zinc-500">Data</span>
+          <input type="date" value={d} max={todayStr()} onChange={(e) => e.target.value && setD(e.target.value)} className="bg-black border border-zinc-700 rounded-lg px-3 py-2 text-[14px] focus:outline-none focus:border-green-500 text-white" style={{ colorScheme: "dark" }} />
+        </label>
+        {form.fields}
+        <button onClick={() => onSave(d, form.values())} className="mt-1 bg-green-500 text-black font-semibold rounded-xl py-3 text-[15px]">Salvar</button>
+      </div>
+    </Modal>
+  );
+}
+
+function MeasureGoalsModal({ profile, onSave, onClose }) {
+  const g = (k) => (profile[k] != null && profile[k] !== "" ? String(profile[k]).replace(".", ",") : "");
+  const [w, setW] = useState(g("weightGoal"));
+  const [bf, setBf] = useState(g("bodyFatGoal"));
+  const [wa, setWa] = useState(g("waistGoal"));
+  const val = (s) => (s === "" ? "" : toNum(s) || "");
+  return (
+    <Modal title="Metas de medidas" onClose={onClose}>
+      <div className="flex flex-col gap-3">
+        <Field label="Peso (kg)" value={w} onChange={(e) => setW(e.target.value)} type="number" placeholder="ex: 68" />
+        <Field label="Gordura corporal (%)" value={bf} onChange={(e) => setBf(e.target.value)} type="number" placeholder="ex: 10" />
+        <Field label="Cintura (cm)" value={wa} onChange={(e) => setWa(e.target.value)} type="number" placeholder="ex: 72" />
+        <p className="font-mono text-[11px] text-zinc-500">deixe vazio a meta que não quiser acompanhar</p>
+        <button onClick={() => onSave({ weightGoal: val(w), bodyFatGoal: val(bf), waistGoal: val(wa) })} className="mt-1 bg-green-500 text-black font-semibold rounded-xl py-3 text-[15px]">Salvar metas</button>
+      </div>
+    </Modal>
+  );
+}
+
+// ---------- MÉTRICAS ----------
+function WeekDots({ dots }) {
+  const color = { ok: "#22C55E", partial: "#71717A", miss: "#27272A", future: "transparent" };
+  return (
+    <div className="flex gap-2.5 mt-4">
+      {dots.map((s, i) => (
+        <div key={i} className="flex flex-col items-center gap-1">
+          <div className="w-[18px] h-[18px] rounded-full" style={{ background: color[s], border: s === "future" ? "1.5px dashed #3F3F46" : "none" }} />
+          <span className="font-mono text-[9px] text-zinc-600">{"STQQSSD"[i]}</span>
         </div>
-      )}
+      ))}
+    </div>
+  );
+}
 
-      <button onClick={() => setShowMore((s) => !s)} className="mt-3 flex items-center gap-1 text-[12px] font-mono text-zinc-400">
-        {showMore ? <ChevronUp size={13} /> : <ChevronDown size={13} />} mais medidas e foto
-      </button>
-
-      {showMore && (
-        <div className="mt-3 flex flex-col gap-3">
-          <div className="grid grid-cols-3 gap-3">
-            <Field label="Peito (cm)" value={chest} onChange={(e) => setChest(e.target.value)} type="number" />
-            <Field label="Quadril (cm)" value={hip} onChange={(e) => setHip(e.target.value)} type="number" />
-            <Field label="Braço (cm)" value={arm} onChange={(e) => setArm(e.target.value)} type="number" />
-          </div>
-          <Field label="Coxa (cm)" value={thigh} onChange={(e) => setThigh(e.target.value)} type="number" />
-          <label className="flex flex-col gap-1">
-            <span className="text-[11px] font-mono uppercase tracking-wider text-zinc-500">Observações</span>
-            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="bg-black border border-zinc-700 rounded-lg px-3 py-2 text-[14px] focus:outline-none focus:border-green-500 resize-none" />
-          </label>
-          <div>
-            <input ref={fileRef} type="file" accept="image/*" onChange={handlePhoto} className="hidden" />
-            <button onClick={() => fileRef.current?.click()} className="flex items-center gap-2 text-[13px] font-mono text-zinc-400 border border-zinc-700 rounded-lg px-3 py-2">
-              <Camera size={14} /> {photo ? "trocar foto de hoje" : "adicionar foto de hoje"}
-            </button>
-            {photo && <img src={photo} alt="evolução" className="mt-2 h-24 rounded-lg object-cover border border-zinc-700" />}
-          </div>
+function MetricCard({ title, pct, main, mainSuffix, mainLabel, successDays, streak, dots, footer }) {
+  const lvl = pct != null ? commitmentLevel(pct) : null;
+  return (
+    <div className="bg-zinc-900 border border-zinc-800 rounded-3xl px-5 py-5">
+      <div className="flex items-center justify-between">
+        <p className="text-[18px] font-medium">{title}</p>
+        {lvl && <span className="font-mono text-[11px] font-semibold tracking-wider px-3 py-1.5 rounded-full bg-black" style={{ color: lvl.color }}>{lvl.label}</span>}
+      </div>
+      <div className="mt-4 flex items-end justify-between">
+        <div>
+          <p className="font-mono text-[32px] leading-none font-semibold tabular-nums">{main}<span className="text-[15px] text-zinc-400 font-normal">{mainSuffix}</span></p>
+          <p className="text-[13px] text-zinc-500 mt-1.5">{mainLabel}</p>
         </div>
-      )}
-
-      <div className="mt-4 flex gap-2">
-        <button onClick={save} className="flex-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] flex items-center justify-center gap-1.5"><Check size={15} /> Salvar medidas de hoje</button>
-        {evolutionLog[date] && (
-          <button
-            onClick={() => { if (confirm("Apagar as medidas lançadas neste dia?")) onDelete(); }}
-            className="px-3.5 border border-zinc-700 rounded-lg text-zinc-400 active:text-white transition"
-            aria-label="Apagar medidas do dia"
-          >
-            <Trash2 size={16} />
-          </button>
+        {pct != null && (
+          <div className="text-right">
+            <p className="font-mono text-[26px] leading-none font-semibold tabular-nums">{pct}<span className="text-[14px] text-zinc-400"> %</span></p>
+            <p className="text-[13px] text-zinc-500 mt-1.5">Comprometimento</p>
+          </div>
         )}
       </div>
-
-      {weightChart.length > 1 && (
-        <div className="mt-8 -ml-2">
-          <div className="flex items-baseline gap-2 mb-2 ml-2">
-            <span className="font-mono text-2xl font-semibold">{lastWeight.peso}kg</span>
-            {weightDelta !== null && <span className={`font-mono text-[12px] ${weightDelta <= 0 ? "text-green-600" : "text-white"}`}>{weightDelta > 0 ? "+" : ""}{weightDelta}kg no período</span>}
-          </div>
-          <MiniLineChart data={weightChart} dataKey="peso" color="#22C55E" height={150} />
+      {pct != null && (
+        <div className="mt-4 h-[5px] rounded-full bg-zinc-800 overflow-hidden">
+          <div className="h-full rounded-full transition-all duration-500" style={{ width: `${Math.min(100, pct)}%`, background: "#F4F1E8" }} />
         </div>
       )}
-
-      {bfChart.length > 1 && (
-        <div className="mt-6 -ml-2">
-          <span className="font-mono text-[11px] text-zinc-500 uppercase tracking-wider ml-2">% gordura corporal</span>
-          <MiniLineChart data={bfChart} dataKey="gordura" color="#FFFFFF" height={130} />
-        </div>
-      )}
-
-      <PhotoCompare evolutionLog={evolutionLog} />
-      <MeasurementCarousel evolutionLog={evolutionLog} />
-
-      {photos.length > 0 && (
-        <div className="mt-8">
-          <h3 className="font-display text-lg font-semibold tracking-tight mb-2">Fotos de evolução</h3>
-          <div className="flex gap-2 overflow-x-auto pb-1">
-            {photos.map(([d, v]) => (
-              <div key={d} className="flex-shrink-0">
-                <img src={v.photo} alt={d} className="h-28 w-24 object-cover rounded-lg border border-zinc-700" />
-                <p className="text-center font-mono text-[10px] text-zinc-500 mt-1">{fmtShort(d)}</p>
-              </div>
-            ))}
+      {dots && (
+        <>
+          <div className="mt-4 grid grid-cols-2">
+            <div className="pr-3 border-r border-zinc-800">
+              <p className="text-[13px] text-zinc-500">Dias de sucesso</p>
+              <p className="font-mono text-[22px] font-semibold mt-0.5">{successDays || "–"}</p>
+            </div>
+            <div className="pl-4">
+              <p className="text-[13px] text-zinc-500">Sequência máxima</p>
+              <p className="font-mono text-[22px] font-semibold mt-0.5">{streak || "–"}</p>
+            </div>
           </div>
+          <WeekDots dots={dots} />
+        </>
+      )}
+      {footer && footer.length > 0 && (
+        <div className={`mt-4 pt-4 border-t border-zinc-800 grid gap-2`} style={{ gridTemplateColumns: `repeat(${footer.length}, minmax(0, 1fr))` }}>
+          {footer.map((f, i) => (
+            <div key={f.label} className={i ? "pl-3 border-l border-zinc-800" : ""}>
+              <p className="text-[12px] text-zinc-500">{f.label}</p>
+              <p className="font-mono text-[17px] font-semibold mt-0.5 tabular-nums">{f.value}<span className="text-[12px] text-zinc-400 font-normal">{f.suffix}</span></p>
+            </div>
+          ))}
         </div>
       )}
     </div>
   );
 }
 
-function PhotoCompare({ evolutionLog }) {
-  const photoDates = Object.entries(evolutionLog).filter(([, v]) => v.photo).map(([d]) => d).sort();
-  const [fromDate, setFromDate] = useState(photoDates[0] || "");
-  const [toDate, setToDate] = useState(photoDates[photoDates.length - 1] || "");
+function MetricasTab({ foodLog, trainingLog, waterLog, activityLog, profile, macroGoals, onImportAppleHealth, profileName }) {
+  const [anchor, setAnchor] = useState(todayStr());
+  const dates = weekDates(anchor);
+  const isCurrent = dates.includes(todayStr());
+  const m = computeWeekMetrics({ dates, foodLog, trainingLog, waterLog, activityLog, profile, macroGoals });
 
-  useEffect(() => {
-    if (photoDates.length === 0) return;
-    if (!photoDates.includes(fromDate)) setFromDate(photoDates[0]);
-    if (!photoDates.includes(toDate)) setToDate(photoDates[photoDates.length - 1]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [evolutionLog]);
-
-  if (photoDates.length < 2) return null;
-
-  const monthsBetween = (a, b) => {
-    const days = Math.round((new Date(b + "T00:00:00") - new Date(a + "T00:00:00")) / 86400000);
-    if (days < 30) return `${days} dias`;
-    const months = Math.round(days / 30);
-    return `${months} ${months === 1 ? "mês" : "meses"}`;
-  };
-
-  return (
-    <div className="mt-8">
-      <h3 className="font-display text-lg font-semibold tracking-tight mb-2">Comparar fotos</h3>
-      <div className="relative rounded-xl overflow-hidden border border-zinc-800">
-        <div className="flex">
-          <img src={evolutionLog[fromDate].photo} alt={fromDate} className="w-1/2 h-56 object-cover" />
-          <img src={evolutionLog[toDate].photo} alt={toDate} className="w-1/2 h-56 object-cover" />
-        </div>
-        <div className="absolute inset-x-0 bottom-0 flex justify-between items-end p-2 bg-black">
-          <span className="font-mono text-[11px] text-white">{fmtShort(fromDate)}</span>
-          <span className="font-mono text-[10px] bg-zinc-800 text-zinc-400 px-2 py-1 rounded-full border border-zinc-700">em {monthsBetween(fromDate, toDate)}</span>
-          <span className="font-mono text-[11px] text-white">{fmtShort(toDate)}</span>
-        </div>
-      </div>
-      <div className="mt-2 grid grid-cols-2 gap-2">
-        <select value={fromDate} onChange={(e) => setFromDate(e.target.value)} className="bg-black border border-zinc-700 rounded-lg px-2 py-1.5 text-[12px] font-mono focus:outline-none focus:border-green-500">
-          {photoDates.map((d) => <option key={d} value={d}>{fmtShort(d)}</option>)}
-        </select>
-        <select value={toDate} onChange={(e) => setToDate(e.target.value)} className="bg-black border border-zinc-700 rounded-lg px-2 py-1.5 text-[12px] font-mono focus:outline-none focus:border-green-500">
-          {photoDates.map((d) => <option key={d} value={d}>{fmtShort(d)}</option>)}
-        </select>
-      </div>
-    </div>
-  );
-}
-
-function MeasurementCarousel({ evolutionLog }) {
-  const sorted = Object.entries(evolutionLog).sort(([a], [b]) => a.localeCompare(b));
-  const fields = [
-    { key: "weight", label: "Peso", unit: "kg", goodDirection: null },
-    { key: "waist", label: "Cintura", unit: "cm", goodDirection: "down" },
-    { key: "neck", label: "Pescoço", unit: "cm", goodDirection: null },
-    { key: "bodyFat", label: "% Gordura", unit: "%", goodDirection: "down" },
-    { key: "chest", label: "Peito", unit: "cm", goodDirection: null },
-    { key: "hip", label: "Quadril", unit: "cm", goodDirection: null },
-    { key: "arm", label: "Braço", unit: "cm", goodDirection: null },
-    { key: "thigh", label: "Coxa", unit: "cm", goodDirection: null },
-  ];
-  const cards = fields.map((f) => {
-    const points = sorted.filter(([, v]) => v[f.key] != null && v[f.key] !== "").map(([d, v]) => ({ date: d, value: v[f.key] }));
-    if (points.length === 0) return null;
-    const last = points[points.length - 1];
-    const first = points[0];
-    const delta = points.length > 1 ? Math.round((last.value - first.value) * 10) / 10 : null;
-    let color = "#FFFFFF";
-    if (delta !== null && f.goodDirection) {
-      const improved = f.goodDirection === "down" ? delta < 0 : delta > 0;
-      color = improved ? "#22C55E" : "#FFFFFF";
-    }
-    return { ...f, last, delta, color };
-  }).filter(Boolean);
-
-  if (cards.length === 0) return null;
-
-  return (
-    <div className="mt-8">
-      <h3 className="font-display text-lg font-semibold tracking-tight mb-2">Medidas</h3>
-      <div className="flex gap-2 overflow-x-auto pb-1">
-        {cards.map((c) => (
-          <div key={c.key} className="flex-shrink-0 w-32 bg-zinc-900 border border-zinc-800 rounded-xl p-3">
-            <p className="text-[12px] text-zinc-400">{c.label}</p>
-            <p className="font-mono text-xl font-semibold mt-1">{c.last.value}<span className="text-[11px] text-zinc-500"> {c.unit}</span></p>
-            <p className="font-mono text-[10px] text-zinc-500">{fmtShort(c.last.date)}</p>
-            {c.delta !== null && (
-              <p className="font-mono text-[11px] mt-1" style={{ color: c.color }}>
-                {c.delta >= 0 ? "↑" : "↓"} {Math.abs(c.delta)}{c.unit}
-              </p>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-function CheckinTab({ date, foodLog, trainingLog, evolutionLog, kcalGoal, macroGoals, waterLog, waterGoalMl, activityLog, stepsGoal, onImportAppleHealth, profileName }) {
   const healthFileRef = useRef(null);
-  const [importStatus, setImportStatus] = useState(null); // null | "loading" | result | "error" | "empty"
+  const [importStatus, setImportStatus] = useState(null);
   const [importProgress, setImportProgress] = useState(0);
-
   const handleHealthImport = async (e) => {
     const file = e.target.files?.[0];
+    e.target.value = "";
     if (!file) return;
-    if (!file.name.toLowerCase().endsWith(".xml")) {
-      setImportStatus("error");
-      return;
-    }
-    setImportStatus("loading");
-    setImportProgress(0);
+    if (!file.name.toLowerCase().endsWith(".xml")) { setImportStatus("error"); return; }
+    setImportStatus("loading"); setImportProgress(0);
     try {
-      const result = await onImportAppleHealth(file, (bytesRead, totalBytes) => {
-        if (totalBytes) setImportProgress(Math.round((bytesRead / totalBytes) * 100));
-      });
-      if (!result.recordCount) {
-        setImportStatus("empty");
-      } else {
-        setImportStatus(result);
-      }
-    } catch (err) {
-      console.error(err);
-      setImportStatus("error");
-    }
+      const result = await onImportAppleHealth(file, (read, total) => total && setImportProgress(Math.round((read / total) * 100)));
+      setImportStatus(result.recordCount ? result : "empty");
+    } catch (err) { console.error(err); setImportStatus("error"); }
   };
 
-  const dates = weekDates(date);
-
-  const kcalByDate = {};
-  const proteinByDate = {};
-  const carbsByDate = {};
-  const fatByDate = {};
-  Object.entries(foodLog).forEach(([d, meals]) => {
-    const items = Array.isArray(meals) ? meals : Object.values(meals || {}).flat();
-    const sum = items.reduce((s, f) => s + toNum(f.kcal || 0), 0);
-    if (sum > 0) {
-      kcalByDate[d] = sum;
-      proteinByDate[d] = items.reduce((s, f) => s + toNum(f.protein || 0), 0);
-      carbsByDate[d] = items.reduce((s, f) => s + toNum(f.carbs || 0), 0);
-      fatByDate[d] = items.reduce((s, f) => s + toNum(f.fat || 0), 0);
-    }
-  });
-
-  const weekAvg = (byDate, goal) => {
-    const days = dates.filter((d) => byDate[d] != null);
-    if (days.length === 0 || !goal) return { avg: 0, pct: 0, days: 0 };
-    const avg = days.reduce((s, d) => s + byDate[d], 0) / days.length;
-    return { avg: Math.round(avg * 10) / 10, pct: Math.round((avg / goal) * 100), days: days.length };
-  };
-  const proteinWeek = weekAvg(proteinByDate, macroGoals?.protein);
-  const carbsWeek = weekAvg(carbsByDate, macroGoals?.carbs);
-  const fatWeek = weekAvg(fatByDate, macroGoals?.fat);
-
-  const weekWaterDays = dates.filter((d) => waterLog?.[d] > 0);
-  const avgWater = weekWaterDays.length > 0 ? Math.round(weekWaterDays.reduce((s, d) => s + waterLog[d], 0) / weekWaterDays.length) : 0;
-  const waterPct = waterGoalMl > 0 ? Math.round((avgWater / waterGoalMl) * 100) : 0;
-
-  const weekStepsDays = dates.filter((d) => activityLog?.[d]?.steps != null);
-  const avgSteps = weekStepsDays.length > 0 ? Math.round(weekStepsDays.reduce((s, d) => s + activityLog[d].steps, 0) / weekStepsDays.length) : 0;
-  const stepsPct = stepsGoal > 0 ? Math.round((avgSteps / stepsGoal) * 100) : 0;
-
-  const nutritionSuccessSet = new Set(
-    Object.entries(kcalByDate).filter(([, k]) => Math.abs(k - kcalGoal) / kcalGoal <= 0.15).map(([d]) => d)
-  );
-  const weekKcalDays = dates.filter((d) => kcalByDate[d] != null);
-  const avgKcal = weekKcalDays.length > 0 ? Math.round(weekKcalDays.reduce((s, d) => s + kcalByDate[d], 0) / weekKcalDays.length) : 0;
-  const nutritionDots = dates.map((d) => (kcalByDate[d] == null ? "none" : nutritionSuccessSet.has(d) ? "success" : "fail"));
-  const nutritionSuccessDaysWeek = dates.filter((d) => nutritionSuccessSet.has(d)).length;
-  const nutritionMaxStreak = longestStreak(nutritionSuccessSet);
-
-  const trainingSuccessSet = new Set(
-    Object.entries(trainingLog)
-      .filter(([, t]) => (t.adhoc && t.adhoc.length > 0) || (t.progress && Object.values(t.progress).some((p) => p.doneSets > 0)))
-      .map(([d]) => d)
-  );
-  const trainingDots = dates.map((d) => (trainingSuccessSet.has(d) ? "success" : "none"));
-  const trainingSuccessDaysWeek = dates.filter((d) => trainingSuccessSet.has(d)).length;
-  const trainingMaxStreak = longestStreak(trainingSuccessSet);
-
-  const weekEvo = dates.map((d) => evolutionLog[d]).filter(Boolean);
-  const weights = weekEvo.filter((e) => e.weight).map((e) => e.weight);
-  const weightDelta = weights.length > 1 ? Math.round((weights[weights.length - 1] - weights[0]) * 10) / 10 : null;
-
-  const hasAnyData = Object.keys(kcalByDate).length > 0 || Object.keys(trainingLog).length > 0;
+  const d0 = new Date(dates[0] + "T00:00:00"), d6 = new Date(dates[6] + "T00:00:00");
+  const rangeLabel = `${d0.getDate()} ${MONTHS_PT[d0.getMonth()]}${d0.getMonth() !== d6.getMonth() ? "." : ""} – ${d6.getDate()} ${MONTHS_PT[d6.getMonth()]}. ${d6.getFullYear()}`;
 
   const exportReport = () => {
     const w = window.open("", "_blank");
     if (!w) return;
-    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Relatório semanal</title>
-      <style>
-        body{font-family:-apple-system,Arial,sans-serif;padding:32px;color:#111;max-width:640px;margin:0 auto;}
-        h1{font-size:22px;margin-bottom:0;} .sub{color:#666;font-size:13px;margin-top:2px;margin-bottom:24px;}
-        .card{border:1px solid #ddd;border-radius:10px;padding:16px;margin-bottom:14px;}
-        .label{font-size:11px;text-transform:uppercase;color:#888;letter-spacing:.05em;}
-        .val{font-size:22px;font-weight:600;margin-top:2px;}
-        .row{display:flex;justify-content:space-between;gap:16px;}
-      </style></head><body>
-      <h1>Relatório semanal — ${profileName || ""}</h1>
-      <p class="sub">Semana de ${fmtShort(dates[0])} a ${fmtShort(dates[6])}</p>
-      <div class="row">
-        <div class="card" style="flex:1"><div class="label">Nutrição — média diária</div><div class="val">${avgKcal} / ${kcalGoal} kcal</div><div class="label" style="margin-top:8px">Dias dentro da meta: ${nutritionSuccessDaysWeek}/7 · sequência máxima: ${nutritionMaxStreak}</div></div>
-      </div>
-      <div class="row">
-        <div class="card" style="flex:1"><div class="label">Treino</div><div class="val">${trainingSuccessDaysWeek}/7 dias</div><div class="label" style="margin-top:8px">Sequência máxima: ${trainingMaxStreak}</div></div>
-      </div>
-      ${weightDelta !== null ? `<div class="card"><div class="label">Variação de peso na semana</div><div class="val">${weightDelta > 0 ? "+" : ""}${weightDelta}kg</div></div>` : ""}
-      <p class="sub">Gerado em ${new Date().toLocaleDateString("pt-BR")}</p>
-      </body></html>`;
-    w.document.write(html);
+    const row = (label, val) => `<div class="card"><div class="label">${label}</div><div class="val">${val}</div></div>`;
+    w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Relatório semanal</title>
+      <style>body{font-family:-apple-system,Arial,sans-serif;padding:32px;color:#111;max-width:640px;margin:0 auto}h1{font-size:22px;margin-bottom:0}.sub{color:#666;font-size:13px;margin:2px 0 24px}.card{border:1px solid #ddd;border-radius:10px;padding:14px 16px;margin-bottom:10px}.label{font-size:11px;text-transform:uppercase;color:#888;letter-spacing:.05em}.val{font-size:20px;font-weight:600;margin-top:2px}</style></head><body>
+      <h1>Relatório semanal — ${profileName || ""}</h1><p class="sub">${rangeLabel} · comprometimento geral ${m.overall}%</p>
+      ${row("Treinos", `${m.rotina.done}/${m.rotina.goal} · ${m.rotina.pct}%`)}
+      ${row("Nutrição — média diária", `${m.nutricao.avgKcal ?? "–"} / ${m.nutricao.goal} kcal · ${m.nutricao.pct}%`)}
+      ${row("Macros — média diária", `P ${m.nutricao.protein ?? "–"}g · G ${m.nutricao.fat ?? "–"}g · C ${m.nutricao.carbs ?? "–"}g`)}
+      ${row("Água — média diária", `${m.agua.avg ?? "–"} / ${m.agua.goal} ml · ${m.agua.pct}%`)}
+      ${m.passos ? row("Passos — média diária", `${m.passos.avg.toLocaleString("pt-BR")}${m.passos.goal ? ` / ${m.passos.goal.toLocaleString("pt-BR")}` : ""}`) : ""}
+      ${m.recuperacao?.sleepH ? row("Sono — média", `${String(m.recuperacao.sleepH).replace(".", ",")} h`) : ""}
+      <p class="sub">Gerado em ${new Date().toLocaleDateString("pt-BR")}</p></body></html>`);
     w.document.close();
     setTimeout(() => w.print(), 300);
   };
 
+  const overallLvl = commitmentLevel(m.overall);
+
   return (
-    <div className="pt-6 flex flex-col gap-4">
+    <div className="pt-5 flex flex-col gap-3">
       <div className="flex items-center justify-between">
-        <h2 className="font-display text-xl font-semibold tracking-tight">Semana de {fmtShort(dates[0])} a {fmtShort(dates[6])}</h2>
-        <div className="flex gap-2">
-          <input ref={healthFileRef} type="file" accept=".xml" onChange={handleHealthImport} className="hidden" />
-          <button onClick={() => healthFileRef.current?.click()} className="font-mono text-[11px] text-zinc-400 border border-zinc-700 rounded-lg px-2.5 py-1.5 hover:text-white transition">importar Apple Health</button>
-          <button onClick={exportReport} className="font-mono text-[11px] text-zinc-400 border border-zinc-700 rounded-lg px-2.5 py-1.5 hover:text-white transition">exportar relatório</button>
+        <button onClick={() => setAnchor(addDays(dates[0], -7))} className="w-10 h-10 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center active:bg-zinc-800" aria-label="Semana anterior"><ChevronLeft size={18} /></button>
+        <div className="text-center">
+          <p className="font-display text-2xl font-bold leading-none">Tendências</p>
+          <p className="text-[13px] text-zinc-500 mt-1">Semanal · {rangeLabel}</p>
         </div>
+        <button onClick={() => !isCurrent && setAnchor(addDays(dates[0], 7))} disabled={isCurrent} className="w-10 h-10 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center active:bg-zinc-800 disabled:opacity-30" aria-label="Próxima semana"><ChevronRight size={18} /></button>
       </div>
 
+      <div className="bg-zinc-900 border border-zinc-800 rounded-3xl px-5 py-4 flex items-center justify-between">
+        <div>
+          <p className="text-[13px] text-zinc-500">Comprometimento geral</p>
+          <p className="font-mono text-[34px] leading-none font-semibold mt-1">{m.overall}<span className="text-[15px] text-zinc-400"> %</span></p>
+        </div>
+        <span className="font-mono text-[12px] font-semibold tracking-wider px-3 py-1.5 rounded-full bg-black" style={{ color: overallLvl.color }}>{overallLvl.label}</span>
+      </div>
+
+      <MetricCard
+        title="Treinos"
+        pct={m.rotina.pct}
+        main={m.rotina.done}
+        mainSuffix={` / ${m.rotina.goal}`}
+        mainLabel="Concluídos na semana"
+        successDays={m.rotina.done}
+        streak={m.rotina.streak}
+        dots={m.rotina.dots}
+        footer={[
+          ...(m.rotina.avgMinutes != null ? [{ label: "Duração", value: m.rotina.avgMinutes, suffix: " min/dia" }] : []),
+          ...(m.atividade?.activeKcal != null ? [{ label: "Energia ativa", value: m.atividade.activeKcal, suffix: " kcal/dia" }] : []),
+        ]}
+      />
+
+      <MetricCard
+        title="Nutrição"
+        pct={m.nutricao.pct}
+        main={m.nutricao.avgKcal != null ? m.nutricao.avgKcal.toLocaleString("pt-BR") : "–"}
+        mainSuffix={` / ${m.nutricao.goal.toLocaleString("pt-BR")}`}
+        mainLabel="Média diária (kcal)"
+        successDays={m.nutricao.successDays}
+        streak={m.nutricao.streak}
+        dots={m.nutricao.dots}
+        footer={[
+          { label: "Proteína", value: m.nutricao.protein ?? "–", suffix: `/${Math.round(macroGoals.protein)}g` },
+          { label: "Gordura", value: m.nutricao.fat ?? "–", suffix: `/${Math.round(macroGoals.fat)}g` },
+          { label: "Carbo", value: m.nutricao.carbs ?? "–", suffix: `/${Math.round(macroGoals.carbs)}g` },
+        ]}
+      />
+
+      <MetricCard
+        title="Água"
+        pct={m.agua.goal ? m.agua.pct : null}
+        main={m.agua.avg != null ? m.agua.avg.toLocaleString("pt-BR") : "–"}
+        mainSuffix={m.agua.goal ? ` / ${m.agua.goal.toLocaleString("pt-BR")}` : ""}
+        mainLabel="Média diária (ml)"
+        successDays={m.agua.successDays}
+        streak={m.agua.streak}
+        dots={m.agua.dots}
+      />
+
+      {m.passos && (
+        <MetricCard
+          title="Passos"
+          pct={m.passos.pct}
+          main={m.passos.avg.toLocaleString("pt-BR")}
+          mainSuffix={m.passos.goal ? ` / ${(m.passos.goal / 1000).toLocaleString("pt-BR")}K` : ""}
+          mainLabel="Média diária"
+          successDays={m.passos.goal ? m.passos.successDays : null}
+          streak={m.passos.goal ? m.passos.streak : null}
+          dots={m.passos.goal ? m.passos.dots : null}
+          footer={[
+            ...(m.atividade?.distanceKm != null ? [{ label: "Distância", value: fmtNum(m.atividade.distanceKm), suffix: " km/dia" }] : []),
+            ...(m.atividade?.exerciseMin != null ? [{ label: "Exercício", value: m.atividade.exerciseMin, suffix: " min/dia" }] : []),
+          ]}
+        />
+      )}
+
+      {m.recuperacao && (
+        <MetricCard
+          title="Recuperação"
+          main={m.recuperacao.sleepH != null ? fmtNum(m.recuperacao.sleepH) : "–"}
+          mainSuffix=" h"
+          mainLabel="Sono médio por noite"
+          footer={m.recuperacao.restingHr != null ? [{ label: "FC de repouso", value: m.recuperacao.restingHr, suffix: " bpm" }] : []}
+        />
+      )}
+
+      <div className="mt-2 grid grid-cols-2 gap-2">
+        <input ref={healthFileRef} type="file" accept=".xml,text/xml,application/xml" onChange={handleHealthImport} className="hidden" />
+        <button onClick={() => healthFileRef.current?.click()} className="bg-zinc-900 border border-zinc-800 rounded-2xl py-3 text-[13px] text-zinc-300 active:bg-zinc-800">Importar Apple Health</button>
+        <button onClick={exportReport} className="bg-zinc-900 border border-zinc-800 rounded-2xl py-3 text-[13px] text-zinc-300 active:bg-zinc-800">Exportar relatório</button>
+      </div>
       {importStatus === "loading" && <p className="font-mono text-[12px] text-zinc-500">processando export.xml… {importProgress > 0 ? `${importProgress}%` : ""}</p>}
-      {importStatus === "error" && <p className="font-mono text-[12px] text-white bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">arquivo inválido — descompacte o .zip do app Saúde e selecione o export.xml de dentro dele</p>}
-      {importStatus === "empty" && <p className="font-mono text-[12px] text-white bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">o arquivo abriu, mas não encontrei nenhum registro reconhecível — confirma que é o export.xml (não o export_cda.xml, que é outro arquivo dentro do mesmo zip)</p>}
-      {importStatus && !["loading", "error", "empty"].includes(importStatus) && (
+      {importStatus === "error" && <p className="font-mono text-[12px] bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">arquivo inválido — descompacte o .zip do app Saúde e selecione o export.xml de dentro dele</p>}
+      {importStatus === "empty" && <p className="font-mono text-[12px] bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">nenhum registro reconhecível — confirme que é o export.xml (não o export_cda.xml)</p>}
+      {importStatus && typeof importStatus === "object" && (
         <p className="font-mono text-[12px] text-green-500 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">
-          importado: {importStatus.weightAdded} pesos · {importStatus.workoutsAdded} treinos · {importStatus.activityDays} dias de atividade (de {importStatus.recordCount.toLocaleString("pt-BR")} registros lidos)
-        </p>
-      )}
-
-      <TrendCard title="Nutrição" current={avgKcal} goal={kcalGoal} unit="cal" weekDots={nutritionDots} successDays={nutritionSuccessDaysWeek} maxStreak={nutritionMaxStreak} />
-      <TrendCard title="Treino" current={trainingSuccessDaysWeek} goal={7} unit="dias" weekDots={trainingDots} successDays={trainingSuccessDaysWeek} maxStreak={trainingMaxStreak} />
-
-      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
-        <p className="text-[15px] font-medium mb-3">Comprometimento com macros e água</p>
-        <div className="flex flex-col gap-3">
-          <AdherenceRow label="Proteína" avg={proteinWeek.avg} goal={macroGoals?.protein} unit="g" pct={proteinWeek.pct} color="#22C55E" />
-          <AdherenceRow label="Carboidrato" avg={carbsWeek.avg} goal={macroGoals?.carbs} unit="g" pct={carbsWeek.pct} color="#16A34A" />
-          <AdherenceRow label="Gordura" avg={fatWeek.avg} goal={macroGoals?.fat} unit="g" pct={fatWeek.pct} color="#FFFFFF" />
-          <AdherenceRow label="Água" avg={avgWater} goal={waterGoalMl} unit="ml" pct={waterPct} color="#FFFFFF" />
-          {stepsGoal > 0 && <AdherenceRow label="Passos" avg={avgSteps} goal={stepsGoal} unit="" pct={stepsPct} color="#FFFFFF" />}
-        </div>
-      </div>
-
-      {weightDelta !== null && (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-3.5 flex items-center justify-between">
-          <span className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">Variação de peso na semana</span>
-          <span className="font-mono text-[15px] font-semibold">{weightDelta > 0 ? "+" : ""}{weightDelta}kg</span>
-        </div>
-      )}
-
-      {!hasAnyData && (
-        <p className="mt-2 text-center text-[13px] text-zinc-500 font-mono py-8 border-t border-b border-zinc-800">
-          registre alimentos e treinos na semana para ver seu check-in
+          importado: {importStatus.activityDays} dias de atividade · {importStatus.workoutsAdded} treinos · {importStatus.weightAdded} pesos{importStatus.bodyFatAdded ? ` · ${importStatus.bodyFatAdded} % gordura` : ""} ({importStatus.recordCount.toLocaleString("pt-BR")} registros lidos)
         </p>
       )}
     </div>
   );
 }
 
-function pctColor(pct) {
-  if (pct <= 50) return "#EF4444";
-  if (pct <= 80) return "#F97316";
-  return "#22C55E";
+// ---------- CHECK-IN ----------
+const POSES = [{ id: "front", label: "Frente" }, { id: "side", label: "Lado" }, { id: "back", label: "Costas" }];
+
+function checkinWindow(today, checkins) {
+  const dates = weekDates(today);
+  const sat = dates[5], sun = dates[6];
+  const dow = new Date(today + "T00:00:00").getDay();
+  const isWeekend = dow === 6 || dow === 0;
+  const done = checkins[sat] ? sat : checkins[sun] ? sun : null;
+  return { isWeekend, done, nextSat: sat };
 }
 
-function round1(n) {
-  return Math.round((Number(n) || 0) * 10) / 10;
-}
-
-function AdherenceRow({ label, avg, goal, unit, pct, color }) {
-  const barPct = Math.min(100, pct || 0);
-  const barColor = pctColor(pct || 0);
+function PhotoSlot({ label, src, onPick }) {
+  const ref = useRef(null);
   return (
-    <div>
-      <div className="flex items-center justify-between mb-1">
-        <span className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">{label}</span>
-        <span className="font-mono text-[12px] text-zinc-300">{round1(avg)}<span className="text-zinc-600">/{round1(goal)}{unit}</span> · <span style={{ color: barColor }}>{pct || 0}%</span></span>
-      </div>
-      <div className="h-[6px] rounded-full bg-zinc-800 overflow-hidden">
-        <div className="h-full rounded-full transition-all duration-500" style={{ width: `${barPct}%`, background: barColor }} />
-      </div>
+    <div className="flex flex-col items-center gap-1.5">
+      <input ref={ref} type="file" accept="image/*" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) onPick(f); }} />
+      <button onClick={() => ref.current?.click()} className="w-full aspect-[3/4] rounded-2xl overflow-hidden bg-black border border-dashed border-zinc-700 flex items-center justify-center active:border-green-500">
+        {src ? <img src={src} alt={label} className="w-full h-full object-cover" /> : <Camera size={24} className="text-zinc-500" />}
+      </button>
+      <span className="text-[13px] font-medium">{label}</span>
     </div>
   );
 }
 
-function TrendCard({ title, current, goal, unit, weekDots, successDays, maxStreak }) {
-  const pct = goal > 0 ? Math.min(999, Math.round((current / goal) * 100)) : 0;
-  const barColor = pctColor(pct);
+function CheckinForm({ date, existing, existingPhotos, evolutionEntry, heightCm, onSave, onCancel }) {
+  const [photos, setPhotos] = useState(existingPhotos || {});
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const form = useMeasureForm(evolutionEntry, heightCm);
+  const pick = async (pose, file) => {
+    try { const url = await compressImage(file, 720, 0.72); setPhotos((p) => ({ ...p, [pose]: url })); }
+    catch (e) { setError("não consegui ler essa foto"); }
+  };
+  const nPhotos = POSES.filter((p) => photos[p.id]).length;
+  const save = async () => {
+    setSaving(true); setError(null);
+    const res = await onSave(date, photos, form.values());
+    setSaving(false);
+    if (res && !res.ok) setError(res.message || "erro ao salvar — verifique a conexão com o Supabase");
+  };
   return (
-    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
-      <p className="text-[15px] font-medium">{title}</p>
-      <div className="mt-3 flex items-end justify-between">
+    <div className="pt-5">
+      <button onClick={onCancel} className="flex items-center gap-1 text-[13px] text-zinc-400 mb-3"><ChevronLeft size={15} /> Check-ins</button>
+      <h2 className="font-display text-3xl font-bold tracking-tight">{existing ? "Editar check-in" : "Novo check-in"}</h2>
+      <p className="text-[13px] text-zinc-500 mt-0.5">{fmtWeekdayLong(date)}</p>
+
+      <p className="mt-5 text-[17px] font-semibold">Fotos</p>
+      <p className="text-[12px] text-zinc-500 mb-3">mesmo lugar, mesma luz e mesma pose toda semana</p>
+      <div className="grid grid-cols-3 gap-2.5">
+        {POSES.map((p) => <PhotoSlot key={p.id} label={p.label} src={photos[p.id]} onPick={(f) => pick(p.id, f)} />)}
+      </div>
+
+      <p className="mt-6 text-[17px] font-semibold mb-3">Medidas</p>
+      {form.fields}
+
+      {error && <p className="mt-3 font-mono text-[12px] bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2">{error}</p>}
+      <button onClick={save} disabled={saving || nPhotos === 0} className="mt-5 w-full bg-green-500 disabled:bg-zinc-800 disabled:text-zinc-500 text-black font-semibold rounded-2xl py-4 text-[16px]">
+        {saving ? "salvando…" : nPhotos === 0 ? "adicione pelo menos uma foto" : "Salvar check-in"}
+      </button>
+    </div>
+  );
+}
+
+function CheckinTab({ checkins, evolutionLog, heightCm, loadPhotos, onSave, onDelete }) {
+  const today = todayStr();
+  const [view, setView] = useState({ name: "list" }); // list | detail | form
+  const [photoCache, setPhotoCache] = useState({});
+  const [compareA, setCompareA] = useState("");
+  const [compareB, setCompareB] = useState("");
+  const [comparePose, setComparePose] = useState("front");
+
+  // check-ins novos + fotos antigas (lançadas pela tela de evolução)
+  const legacyDates = Object.entries(evolutionLog).filter(([d, v]) => v && v.photo && !checkins[d]).map(([d]) => d);
+  const allDates = [...Object.keys(checkins), ...legacyDates].sort().reverse();
+
+  useEffect(() => {
+    let alive = true;
+    const missing = Object.keys(checkins).filter((d) => !photoCache[d]);
+    if (missing.length === 0) return;
+    Promise.all(missing.map(async (d) => [d, (await loadPhotos(d)) || {}])).then((pairs) => {
+      if (alive) setPhotoCache((c) => ({ ...c, ...Object.fromEntries(pairs) }));
+    });
+    return () => { alive = false; };
+  }, [checkins]);
+
+  const photosOf = (d) => (checkins[d] ? photoCache[d] || {} : { front: evolutionLog[d]?.photo });
+  const win = checkinWindow(today, checkins);
+
+  useEffect(() => {
+    if (!compareA && allDates.length > 1) { setCompareA(allDates[allDates.length - 1]); setCompareB(allDates[0]); }
+  }, [allDates.length]);
+
+  if (view.name === "form") {
+    return (
+      <CheckinForm
+        date={view.date}
+        existing={!!checkins[view.date]}
+        existingPhotos={photoCache[view.date]}
+        evolutionEntry={evolutionLog[view.date]}
+        heightCm={heightCm}
+        onCancel={() => setView(checkins[view.date] ? { name: "detail", date: view.date } : { name: "list" })}
+        onSave={async (d, photos, measures) => {
+          const res = await onSave(d, photos, measures);
+          if (res.ok) { setPhotoCache((c) => ({ ...c, [d]: photos })); setView({ name: "detail", date: d }); }
+          return res;
+        }}
+      />
+    );
+  }
+
+  if (view.name === "detail") {
+    const d = view.date;
+    const ph = photosOf(d);
+    const ev = evolutionLog[d] || {};
+    const isLegacy = !checkins[d];
+    return (
+      <div className="pt-5">
+        <button onClick={() => setView({ name: "list" })} className="flex items-center gap-1 text-[13px] text-zinc-400 mb-3"><ChevronLeft size={15} /> Check-ins</button>
+        <h2 className="font-display text-3xl font-bold tracking-tight">Detalhes do check-in</h2>
+        <p className="text-[13px] text-zinc-500 mt-0.5">{fmtWeekdayLong(d)}</p>
+
+        <p className="mt-5 text-[17px] font-semibold mb-3">Fotos</p>
+        <div className="bg-zinc-900 border border-zinc-800 rounded-3xl p-4">
+          <div className="flex gap-3 overflow-x-auto snap-x">
+            {POSES.filter((p) => ph[p.id]).map((p) => (
+              <div key={p.id} className="flex-shrink-0 w-[70%] sm:w-[45%] snap-start">
+                <img src={ph[p.id]} alt={p.label} className="w-full aspect-[3/4] object-cover rounded-2xl" />
+                <p className="text-center text-[14px] font-medium mt-2">{isLegacy ? "Foto" : p.label}</p>
+              </div>
+            ))}
+            {POSES.every((p) => !ph[p.id]) && <p className="font-mono text-[12px] text-zinc-500 py-6">carregando fotos…</p>}
+          </div>
+        </div>
+
+        <p className="mt-6 text-[17px] font-semibold mb-3">Medidas</p>
+        <div className="bg-zinc-900 border border-zinc-800 rounded-3xl px-5">
+          {MEASURES.map((m, i) => (
+            <div key={m.key} className={`flex items-center justify-between py-4 ${i ? "border-t border-zinc-800" : ""}`}>
+              <span className="text-[15px] text-zinc-400">{m.label}</span>
+              <span className="font-mono text-[17px] font-semibold">{fmtNum(ev[m.key])}<span className="text-[13px] text-zinc-400 font-normal"> {m.unit}</span></span>
+            </div>
+          ))}
+        </div>
+
+        {!isLegacy && (
+          <div className="mt-5 grid grid-cols-2 gap-2">
+            <button onClick={() => setView({ name: "form", date: d })} className="bg-zinc-900 border border-zinc-800 rounded-2xl py-3 text-[14px] active:bg-zinc-800">Editar</button>
+            <button onClick={async () => { if (confirm("Apagar este check-in? As medidas continuam salvas em Medidas.")) { await onDelete(d); setView({ name: "list" }); } }} className="bg-zinc-900 border border-zinc-800 rounded-2xl py-3 text-[14px] text-red-400 active:bg-zinc-800">Apagar</button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="pt-5 flex flex-col gap-4">
+      {/* status da semana */}
+      {win.done ? (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-3xl px-5 py-4 flex items-center gap-3">
+          <div className="w-10 h-10 rounded-full bg-green-500 text-black flex items-center justify-center"><Check size={20} /></div>
+          <div className="flex-1">
+            <p className="text-[15px] font-semibold">Check-in da semana feito</p>
+            <p className="text-[12px] text-zinc-500">{fmtWeekdayLong(win.done)} · próximo no sábado</p>
+          </div>
+        </div>
+      ) : win.isWeekend ? (
+        <button onClick={() => setView({ name: "form", date: today })} className="w-full bg-green-500 text-black rounded-3xl px-5 py-5 flex items-center gap-4 active:brightness-90 text-left">
+          <div className="w-12 h-12 rounded-2xl bg-black text-green-500 flex items-center justify-center"><Camera size={24} /></div>
+          <div className="flex-1">
+            <p className="font-display text-2xl font-bold uppercase leading-none">Fazer check-in</p>
+            <p className="text-[13px] mt-1 opacity-80">fotos de frente, lado e costas + medidas</p>
+          </div>
+          <ChevronRight size={22} />
+        </button>
+      ) : (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-3xl px-5 py-4 flex items-center gap-3">
+          <div className="w-10 h-10 rounded-full bg-black border border-zinc-800 flex items-center justify-center text-zinc-500"><CalendarCheck size={18} /></div>
+          <div>
+            <p className="text-[15px] font-semibold">Próximo check-in</p>
+            <p className="text-[12px] text-zinc-500">{fmtWeekdayLong(win.nextSat)} ou domingo</p>
+          </div>
+        </div>
+      )}
+
+      {/* linha do tempo */}
+      {allDates.length === 0 ? (
+        <p className="text-center text-[13px] text-zinc-500 font-mono py-10">nenhum check-in ainda</p>
+      ) : (
+        <div className="relative">
+          {allDates.map((d, idx) => {
+            const ph = photosOf(d);
+            const ev = evolutionLog[d] || {};
+            return (
+              <div key={d} className="relative pl-6 pb-5">
+                <div className="absolute left-[5px] top-2 bottom-0 w-[2px] bg-zinc-800" style={{ display: idx === allDates.length - 1 ? "none" : "block" }} />
+                <div className="absolute left-0 top-[7px] w-3 h-3 rounded-full bg-[#F4F1E8]" />
+                <button onClick={() => setView({ name: "detail", date: d })} className="w-full text-left">
+                  <div className="flex items-center justify-between mb-2.5">
+                    <p className="text-[17px] font-semibold">{fmtWeekdayLong(d)}</p>
+                    <ChevronRight size={18} className="text-zinc-500" />
+                  </div>
+                  <div className="bg-zinc-900 border border-zinc-800 rounded-3xl p-4">
+                    <div className="grid grid-cols-3 gap-2.5">
+                      {POSES.map((p) => (
+                        <div key={p.id} className="aspect-[3/4] rounded-2xl overflow-hidden bg-black">
+                          {ph[p.id] && <img src={ph[p.id]} alt={p.label} className="w-full h-full object-cover" loading="lazy" />}
+                        </div>
+                      ))}
+                    </div>
+                    <div className="mt-3 grid grid-cols-3 gap-2.5">
+                      {MEASURES.map((m) => (
+                        <div key={m.key} className="min-w-0">
+                          <p className="text-[12px] text-zinc-500 truncate">{m.label}</p>
+                          <p className="font-mono text-[17px] font-semibold">{fmtNum(ev[m.key])}<span className="text-[12px] text-zinc-400 font-normal"> {m.unit}</span></p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* comparar */}
+      {allDates.length > 1 && compareA && compareB && (
         <div>
-          <p className="font-mono text-3xl font-semibold">{current}<span className="text-[13px] text-zinc-500"> / {goal} {unit}</span></p>
-          <p className="font-mono text-[10px] text-zinc-500 mt-0.5">Média diária</p>
+          <p className="text-[17px] font-semibold mb-3">Comparar</p>
+          <div className="bg-zinc-900 border border-zinc-800 rounded-3xl p-4">
+            <div className="flex gap-1 bg-black rounded-xl p-1 mb-3">
+              {POSES.map((p) => (
+                <button key={p.id} onClick={() => setComparePose(p.id)} className={`flex-1 py-2 rounded-lg text-[13px] ${comparePose === p.id ? "bg-zinc-800 text-white" : "text-zinc-500"}`}>{p.label}</button>
+              ))}
+            </div>
+            <div className="grid grid-cols-2 gap-2.5">
+              {[[compareA, setCompareA], [compareB, setCompareB]].map(([val, setVal], i) => {
+                const ph = photosOf(val);
+                const src = ph[comparePose] || (!checkins[val] ? ph.front : null);
+                return (
+                  <div key={i}>
+                    <div className="aspect-[3/4] rounded-2xl overflow-hidden bg-black flex items-center justify-center">
+                      {src ? <img src={src} alt={val} className="w-full h-full object-cover" /> : <span className="font-mono text-[11px] text-zinc-600">sem foto</span>}
+                    </div>
+                    <select value={val} onChange={(e) => setVal(e.target.value)} className="mt-2 w-full bg-black border border-zinc-800 rounded-lg px-2 py-2 text-[12px] font-mono" style={{ colorScheme: "dark" }}>
+                      {allDates.map((d) => <option key={d} value={d}>{fmtLong(d)}</option>)}
+                    </select>
+                    <p className="font-mono text-[11px] text-zinc-500 mt-1 text-center">{fmtNum(evolutionLog[val]?.weight)} kg · {fmtNum(evolutionLog[val]?.bodyFat)}% · {fmtNum(evolutionLog[val]?.waist)} cm</p>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         </div>
-        <div className="text-right">
-          <p className="font-mono text-xl font-semibold" style={{ color: barColor }}>{pct}%</p>
-          <p className="font-mono text-[10px] text-zinc-500">Comprometimento</p>
-        </div>
-      </div>
-      <div className="mt-3 h-[6px] rounded-full bg-zinc-800 overflow-hidden">
-        <div className="h-full rounded-full transition-all duration-500" style={{ width: `${Math.min(100, pct)}%`, background: barColor }} />
-      </div>
-      <div className="mt-4 flex items-center justify-between">
-        <div>
-          <p className="font-mono text-[10px] text-zinc-500 uppercase tracking-wider">Dias de sucesso</p>
-          <p className="font-mono text-lg font-semibold">{successDays}</p>
-        </div>
-        <div>
-          <p className="font-mono text-[10px] text-zinc-500 uppercase tracking-wider">Sequência máxima</p>
-          <p className="font-mono text-lg font-semibold">{maxStreak}</p>
-        </div>
-      </div>
-      <div className="mt-3 flex gap-2">
-        {weekDots.map((s, i) => (
-          <div key={i} className={`flex-1 h-2.5 rounded-full ${s === "success" ? "bg-green-500" : s === "fail" ? "bg-zinc-700" : "bg-zinc-800"}`} />
-        ))}
-      </div>
+      )}
     </div>
   );
 }
@@ -2140,8 +2744,9 @@ function ProfileModal({ profile, onSave, onClose, onSwitchProfile, profileName }
 
         <Field label="Meta de água diária (ml)" value={form.waterGoalMl} onChange={set("waterGoalMl")} type="number" />
         <Field label="Meta de passos diária (opcional)" value={form.stepsGoal} onChange={set("stepsGoal")} type="number" placeholder="ex: 8000" />
+        <Field label="Meta de treinos por semana" value={form.trainingDaysPerWeek} onChange={set("trainingDaysPerWeek")} type="number" placeholder="ex: 5" />
 
-        <button onClick={() => onSave({ ...form, heightCm: toNum(form.heightCm) || 0, refWeight, kcal, proteinPerKg: toNum(form.proteinPerKg) || 0, fatPerKg: toNum(form.fatPerKg) || 0, waterGoalMl: toNum(form.waterGoalMl) || 0, stepsGoal: form.stepsGoal === "" ? "" : toNum(form.stepsGoal) || 0 })} className="mt-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] hover:brightness-110 transition">Salvar perfil</button>
+        <button onClick={() => onSave({ ...form, heightCm: toNum(form.heightCm) || 0, refWeight, kcal, proteinPerKg: toNum(form.proteinPerKg) || 0, fatPerKg: toNum(form.fatPerKg) || 0, waterGoalMl: toNum(form.waterGoalMl) || 0, stepsGoal: form.stepsGoal === "" ? "" : toNum(form.stepsGoal) || 0, trainingDaysPerWeek: toNum(form.trainingDaysPerWeek) || 5 })} className="mt-1 bg-green-500 text-black font-semibold rounded-lg py-2.5 text-[14px] hover:brightness-110 transition">Salvar perfil</button>
       </div>
     </Modal>
   );
