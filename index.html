@@ -1888,19 +1888,23 @@ function trainedOn(trainingLog, d) {
 // calcula tudo de uma semana — usado na tela inicial e em Métricas
 function computeWeekMetrics({ dates, foodLog, trainingLog, waterLog, activityLog, profile, macroGoals }) {
   const today = todayStr();
-  const elapsed = dates.filter((d) => d <= today);
+  // dias antes do primeiro registro no app não contam (senão 3 e 6 meses ficam sempre "baixo")
+  const firstUse = [foodLog, trainingLog, waterLog].flatMap((o) => Object.keys(o || {})).sort()[0] || today;
+  const counts = (d) => d <= today && d >= firstUse;
+  const elapsed = dates.filter(counts);
   const nDays = Math.max(1, elapsed.length);
   const avg = (vals) => (vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : null);
 
   // treinos
-  const trainingGoal = toNum(profile.trainingDaysPerWeek) || 5;
+  // meta de treinos proporcional ao tamanho do período (ex.: 5/semana → ~21 em 30 dias)
+  const trainingGoal = Math.max(1, Math.round((toNum(profile.trainingDaysPerWeek) || 5) * Math.max(1, elapsed.length) / 7));
   const trainedSet = new Set(dates.filter((d) => trainedOn(trainingLog, d)));
   const trainedDays = trainedSet.size;
   const workoutMins = dates.map((d) => (trainingLog[d]?.adhoc || []).reduce((s, a) => s + toNum(a.durationMin), 0)).filter((m) => m > 0);
   const rotina = {
     done: trainedDays, goal: trainingGoal,
     pct: Math.min(100, Math.round((trainedDays / trainingGoal) * 100)),
-    dots: dates.map((d) => (trainedSet.has(d) ? "ok" : d <= today ? "miss" : "future")),
+    dots: dates.map((d) => (trainedSet.has(d) ? "ok" : counts(d) ? "miss" : "future")),
     streak: weekStreak(dates, (d) => trainedSet.has(d)),
     avgMinutes: workoutMins.length ? Math.round(workoutMins.reduce((s, v) => s + v, 0) / nDays) : null,
   };
@@ -1917,7 +1921,7 @@ function computeWeekMetrics({ dates, foodLog, trainingLog, waterLog, activityLog
     pct: Math.round((foodDays.reduce((s, [, t]) => s + scoreOf(t.kcal), 0) / nDays) * 100),
     successDays: dates.filter(nutriOk).length,
     streak: weekStreak(dates, nutriOk),
-    dots: dates.map((d) => (nutriOk(d) ? "ok" : foodMap[d] ? "partial" : d <= today ? "miss" : "future")),
+    dots: dates.map((d) => (nutriOk(d) ? "ok" : foodMap[d] ? "partial" : counts(d) ? "miss" : "future")),
     protein: foodDays.length ? Math.round(avg(foodDays.map(([, t]) => t.protein))) : null,
     carbs: foodDays.length ? Math.round(avg(foodDays.map(([, t]) => t.carbs))) : null,
     fat: foodDays.length ? Math.round(avg(foodDays.map(([, t]) => t.fat))) : null,
@@ -1934,7 +1938,7 @@ function computeWeekMetrics({ dates, foodLog, trainingLog, waterLog, activityLog
     pct: waterGoal ? Math.min(100, Math.round((dates.reduce((s, d) => s + Math.min(1, toNum(waterLog[d]) / waterGoal), 0) / nDays) * 100)) : 0,
     successDays: dates.filter(waterOk).length,
     streak: weekStreak(dates, waterOk),
-    dots: dates.map((d) => (waterOk(d) ? "ok" : toNum(waterLog[d]) > 0 ? "partial" : d <= today ? "miss" : "future")),
+    dots: dates.map((d) => (waterOk(d) ? "ok" : toNum(waterLog[d]) > 0 ? "partial" : counts(d) ? "miss" : "future")),
   };
 
   // Apple Health
@@ -1947,7 +1951,7 @@ function computeWeekMetrics({ dates, foodLog, trainingLog, waterLog, activityLog
     pct: stepsGoal ? Math.min(100, Math.round((dates.reduce((s, d) => s + Math.min(1, toNum(activityLog[d]?.steps) / stepsGoal), 0) / nDays) * 100)) : null,
     successDays: dates.filter(stepsOk).length,
     streak: weekStreak(dates, stepsOk),
-    dots: dates.map((d) => (stepsOk(d) ? "ok" : activityLog[d]?.steps != null ? "partial" : d <= today ? "miss" : "future")),
+    dots: dates.map((d) => (stepsOk(d) ? "ok" : activityLog[d]?.steps != null ? "partial" : counts(d) ? "miss" : "future")),
   } : null;
   const kcalVals = act("activeKcal"), distVals = act("distanceKm"), exVals = act("exerciseMin"), sleepVals = act("sleepH"), hrVals = act("restingHr");
   const atividade = (kcalVals.length || distVals.length || exVals.length) ? {
@@ -2294,6 +2298,20 @@ function MeasureGoalsModal({ profile, onSave, onClose }) {
 // ---------- MÉTRICAS ----------
 function WeekDots({ dots }) {
   const color = { ok: "#22C55E", partial: "#71717A", miss: "#27272A", future: "transparent" };
+  if (dots.length > 31) {
+    return (
+      <div className="mt-4 flex gap-[1px] h-4 rounded overflow-hidden">
+        {dots.map((s, i) => <div key={i} className="flex-1" style={{ background: s === "future" ? "#18181B" : color[s] }} />)}
+      </div>
+    );
+  }
+  if (dots.length !== 7) {
+    return (
+      <div className="mt-4 flex flex-wrap gap-1.5">
+        {dots.map((s, i) => <div key={i} className="w-[14px] h-[14px] rounded-full" style={{ background: color[s], border: s === "future" ? "1.5px dashed #3F3F46" : "none" }} />)}
+      </div>
+    );
+  }
   return (
     <div className="flex gap-2.5 mt-4">
       {dots.map((s, i) => (
@@ -2360,10 +2378,30 @@ function MetricCard({ title, pct, main, mainSuffix, mainLabel, successDays, stre
   );
 }
 
+const TREND_PERIODS = [
+  { id: "week", label: "Semana", short: "Semanal", days: 7 },
+  { id: "15d", label: "15 dias", short: "15 dias", days: 15 },
+  { id: "1m", label: "1 mês", short: "Mensal", days: 30 },
+  { id: "3m", label: "3 meses", short: "Trimestral", days: 90 },
+  { id: "6m", label: "6 meses", short: "Semestral", days: 180 },
+];
+
 function MetricasTab({ foodLog, trainingLog, waterLog, activityLog, profile, macroGoals, onImportAppleHealth, profileName }) {
-  const [anchor, setAnchor] = useState(todayStr());
-  const dates = weekDates(anchor);
+  const [period, setPeriod] = useState("week");
+  const [anchor, setAnchor] = useState(todayStr()); // último dia do período
+  const pdef = TREND_PERIODS.find((p) => p.id === period);
+  const dates = period === "week"
+    ? weekDates(anchor)
+    : Array.from({ length: pdef.days }, (_, i) => addDays(anchor, i - pdef.days + 1));
   const isCurrent = dates.includes(todayStr());
+  const shift = (dir) => {
+    if (period === "week") setAnchor(addDays(dates[0], dir * 7));
+    else {
+      const next = addDays(anchor, dir * pdef.days);
+      setAnchor(next > todayStr() ? todayStr() : next);
+    }
+  };
+  const choosePeriod = (id) => { setPeriod(id); setAnchor(todayStr()); };
   const m = computeWeekMetrics({ dates, foodLog, trainingLog, waterLog, activityLog, profile, macroGoals });
 
   const healthFileRef = useRef(null);
@@ -2381,16 +2419,16 @@ function MetricasTab({ foodLog, trainingLog, waterLog, activityLog, profile, mac
     } catch (err) { console.error(err); setImportStatus("error"); }
   };
 
-  const d0 = new Date(dates[0] + "T00:00:00"), d6 = new Date(dates[6] + "T00:00:00");
-  const rangeLabel = `${d0.getDate()} ${MONTHS_PT[d0.getMonth()]}${d0.getMonth() !== d6.getMonth() ? "." : ""} – ${d6.getDate()} ${MONTHS_PT[d6.getMonth()]}. ${d6.getFullYear()}`;
+  const d0 = new Date(dates[0] + "T00:00:00"), d6 = new Date(dates[dates.length - 1] + "T00:00:00");
+  const rangeLabel = `${d0.getDate()} ${MONTHS_PT[d0.getMonth()]}.${d0.getFullYear() !== d6.getFullYear() ? ` ${d0.getFullYear()}` : ""} – ${d6.getDate()} ${MONTHS_PT[d6.getMonth()]}. ${d6.getFullYear()}`;
 
   const exportReport = () => {
     const w = window.open("", "_blank");
     if (!w) return;
     const row = (label, val) => `<div class="card"><div class="label">${label}</div><div class="val">${val}</div></div>`;
-    w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Relatório semanal</title>
+    w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Relatório — ${pdef.label}</title>
       <style>body{font-family:-apple-system,Arial,sans-serif;padding:32px;color:#111;max-width:640px;margin:0 auto}h1{font-size:22px;margin-bottom:0}.sub{color:#666;font-size:13px;margin:2px 0 24px}.card{border:1px solid #ddd;border-radius:10px;padding:14px 16px;margin-bottom:10px}.label{font-size:11px;text-transform:uppercase;color:#888;letter-spacing:.05em}.val{font-size:20px;font-weight:600;margin-top:2px}</style></head><body>
-      <h1>Relatório semanal — ${profileName || ""}</h1><p class="sub">${rangeLabel} · comprometimento geral ${m.overall}%</p>
+      <h1>Relatório ${pdef.short.toLowerCase()} — ${profileName || ""}</h1><p class="sub">${rangeLabel} · comprometimento geral ${m.overall}%</p>
       ${row("Treinos", `${m.rotina.done}/${m.rotina.goal} · ${m.rotina.pct}%`)}
       ${row("Nutrição — média diária", `${m.nutricao.avgKcal ?? "–"} / ${m.nutricao.goal} kcal · ${m.nutricao.pct}%`)}
       ${row("Macros — média diária", `P ${m.nutricao.protein ?? "–"}g · G ${m.nutricao.fat ?? "–"}g · C ${m.nutricao.carbs ?? "–"}g`)}
@@ -2407,12 +2445,18 @@ function MetricasTab({ foodLog, trainingLog, waterLog, activityLog, profile, mac
   return (
     <div className="pt-5 flex flex-col gap-3">
       <div className="flex items-center justify-between">
-        <button onClick={() => setAnchor(addDays(dates[0], -7))} className="w-10 h-10 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center active:bg-zinc-800" aria-label="Semana anterior"><ChevronLeft size={18} /></button>
+        <button onClick={() => shift(-1)} className="w-10 h-10 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center active:bg-zinc-800" aria-label="Período anterior"><ChevronLeft size={18} /></button>
         <div className="text-center">
           <p className="font-display text-2xl font-bold leading-none">Tendências</p>
-          <p className="text-[13px] text-zinc-500 mt-1">Semanal · {rangeLabel}</p>
+          <p className="text-[13px] text-zinc-500 mt-1">{pdef.short} · {rangeLabel}</p>
         </div>
-        <button onClick={() => !isCurrent && setAnchor(addDays(dates[0], 7))} disabled={isCurrent} className="w-10 h-10 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center active:bg-zinc-800 disabled:opacity-30" aria-label="Próxima semana"><ChevronRight size={18} /></button>
+        <button onClick={() => !isCurrent && shift(1)} disabled={isCurrent} className="w-10 h-10 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center active:bg-zinc-800 disabled:opacity-30" aria-label="Próximo período"><ChevronRight size={18} /></button>
+      </div>
+
+      <div className="flex gap-1 bg-zinc-900 border border-zinc-800 rounded-2xl p-1">
+        {TREND_PERIODS.map((p) => (
+          <button key={p.id} onClick={() => choosePeriod(p.id)} className={`flex-1 py-2 rounded-xl text-[12px] font-medium whitespace-nowrap transition ${period === p.id ? "bg-[#F4F1E8] text-black" : "text-zinc-400 active:text-white"}`}>{p.label}</button>
+        ))}
       </div>
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-3xl px-5 py-4 flex items-center justify-between">
@@ -2428,7 +2472,7 @@ function MetricasTab({ foodLog, trainingLog, waterLog, activityLog, profile, mac
         pct={m.rotina.pct}
         main={m.rotina.done}
         mainSuffix={` / ${m.rotina.goal}`}
-        mainLabel="Concluídos na semana"
+        mainLabel={period === "week" ? "Concluídos na semana" : "Concluídos no período"}
         successDays={m.rotina.done}
         streak={m.rotina.streak}
         dots={m.rotina.dots}
